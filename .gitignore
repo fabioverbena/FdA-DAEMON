@@ -16,3 +16,11 @@ progressivo_documenti.json
 
 # local artifacts
 mexal_daemon.log
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# file accidentali
+SMTP_USER=*.txt

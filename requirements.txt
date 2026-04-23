@@ -1,2 +1,5 @@
 PyPDF2>=3.0.0
 pywin32>=306; platform_system=="Windows"
+ttkbootstrap>=1.10.0
+google-api-python-client>=2.100.0
+google-auth>=2.20.0

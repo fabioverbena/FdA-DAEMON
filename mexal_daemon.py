@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox
 import os
 import time
 import json
@@ -17,12 +17,41 @@ from dataclasses import dataclass
 from typing import Optional
 from datetime import datetime
 
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *
+
 from PyPDF2 import PdfReader, PdfWriter
 
 try:
     import win32com.client  # type: ignore
 except Exception:
     win32com = None
+
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    _GDRIVE_AVAILABLE = True
+except ImportError:
+    _GDRIVE_AVAILABLE = False
+
+# Colore badge per tipo documento
+_DOC_BOOTSTYLE: dict[str, str] = {
+    "DDT": "success",
+    "FC":  "primary",
+    "PC":  "warning",
+    "OC":  "info",
+    "OF":  "secondary",
+    "?":   "danger",
+}
+_DOC_TAG_COLOR: dict[str, str] = {
+    "DDT": "#198754",
+    "FC":  "#0d6efd",
+    "PC":  "#e65100",
+    "OC":  "#0dcaf0",
+    "OF":  "#6c757d",
+    "?":   "#dc3545",
+}
 
 
 def _smtp_config() -> dict[str, object]:
@@ -77,6 +106,11 @@ def _load_dotenv(env_path: str) -> None:
 
 DOTENV_PATH = os.path.join(_app_dir(), ".env")
 _load_dotenv(DOTENV_PATH)
+
+GDRIVE_CREDENTIALS        = os.environ.get("GDRIVE_CREDENTIALS", "").strip()
+GDRIVE_INBOX_PD_FOLDER_ID = os.environ.get("GDRIVE_INBOX_PD_FOLDER_ID", "").strip()
+TELEGRAM_BOT_USERNAME     = os.environ.get("TELEGRAM_BOT_USERNAME", "FdA_AutoBOT_bot").strip()
+_GDRIVE_SCOPES            = ["https://www.googleapis.com/auth/drive"]
 
 
 def send_email_smtp(
@@ -148,44 +182,123 @@ def _remove_file_silent(path: str) -> None:
         pass
 
 
-def install_windows_shortcuts() -> None:
-    script_path = os.path.abspath(__file__)
-    workdir = os.path.dirname(script_path)
+def _ps_str(s: str) -> str:
+    return s.replace("'", "''")
 
-    py_exe = sys.executable
-    pyw_exe = py_exe
-    if py_exe.lower().endswith("python.exe"):
-        cand = py_exe[:-10] + "pythonw.exe"
-        if os.path.isfile(cand):
-            pyw_exe = cand
 
-    startup_dir = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
-    desktop_dir = os.path.join(os.path.expanduser("~"), "Desktop")
-    os.makedirs(startup_dir, exist_ok=True)
-    os.makedirs(desktop_dir, exist_ok=True)
-
-    args = f'"{script_path}"'
-    _create_shortcut_ps(
-        link_path=os.path.join(startup_dir, "Mexal Automation Daemon.lnk"),
-        target_path=pyw_exe,
-        arguments=args,
-        working_dir=workdir,
-        description="Mexal Automation Daemon",
+def _register_task_scheduler(task_name: str, exe: str, arguments: str, workdir: str) -> None:
+    """Registra un Task Scheduler con restart-on-failure e delay 60s al logon."""
+    xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT60S</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{exe}</Command>
+      <Arguments>{arguments}</Arguments>
+      <WorkingDirectory>{workdir}</WorkingDirectory>
+    </Exec>
+  </Actions>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>5</Count>
+    </RestartOnFailure>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+  </Settings>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+</Task>"""
+    xml_path = os.path.join(os.environ.get("TEMP", "C:\\Temp"), f"{task_name}.xml")
+    with open(xml_path, "w", encoding="utf-16") as f:
+        f.write(xml)
+    result = subprocess.run(
+        ["schtasks", "/Create", "/TN", task_name, "/XML", xml_path, "/F"],
+        creationflags=0x08000000, capture_output=True,
     )
+    if result.returncode != 0:
+        err = result.stderr.decode(errors="replace") or result.stdout.decode(errors="replace")
+        raise RuntimeError(f"schtasks fallito (rc={result.returncode}): {err.strip()}")
+    _remove_file_silent(xml_path)
+
+
+def install_windows_shortcuts() -> None:
+    if getattr(sys, "frozen", False):
+        exe = os.path.abspath(sys.executable)
+        workdir = os.path.dirname(exe)
+        pyw_exe = exe
+        args_task = ""
+    else:
+        script_path = os.path.abspath(__file__)
+        workdir = os.path.dirname(script_path)
+        py_exe = sys.executable
+        pyw_exe = py_exe
+        if py_exe.lower().endswith("python.exe"):
+            cand = py_exe[:-10] + "pythonw.exe"
+            if os.path.isfile(cand):
+                pyw_exe = cand
+        exe = py_exe
+        args_task = f'"{script_path}"'
+
+    # Task Scheduler (avvio affidabile + restart automatico)
+    _register_task_scheduler("MexalDaemon", pyw_exe, args_task, workdir)
+
+    # Watchdog separato ogni 5 min
+    watchdog_path = os.path.join(workdir, "mexal_watchdog.pyw")
+    if os.path.isfile(watchdog_path):
+        _register_task_scheduler("MexalWatchdog", pyw_exe, f'"{watchdog_path}"', workdir)
+
+    # Collegamento Desktop (per avvio manuale)
+    desktop_dir = os.path.join(os.path.expanduser("~"), "Desktop")
+    os.makedirs(desktop_dir, exist_ok=True)
     _create_shortcut_ps(
         link_path=os.path.join(desktop_dir, "Mexal Automation Daemon.lnk"),
-        target_path=py_exe,
-        arguments=args,
+        target_path=exe,
+        arguments=args_task,
         working_dir=workdir,
         description="Mexal Automation Daemon",
     )
 
 
 def uninstall_windows_shortcuts() -> None:
-    startup_dir = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+    for task in ("MexalDaemon", "MexalWatchdog"):
+        try:
+            subprocess.run(
+                ["schtasks", "/Delete", "/TN", task, "/F"],
+                check=False, creationflags=0x08000000, capture_output=True,
+            )
+        except Exception:
+            pass
     desktop_dir = os.path.join(os.path.expanduser("~"), "Desktop")
-    _remove_file_silent(os.path.join(startup_dir, "Mexal Automation Daemon.lnk"))
     _remove_file_silent(os.path.join(desktop_dir, "Mexal Automation Daemon.lnk"))
+
+
+_SINGLE_INSTANCE_MUTEX = None
+
+
+def _ensure_single_instance(mutex_name: str) -> None:
+    global _SINGLE_INSTANCE_MUTEX
+    try:
+        ERROR_ALREADY_EXISTS = 183
+        handle = ctypes.windll.kernel32.CreateMutexW(None, True, mutex_name)
+        last_error = ctypes.windll.kernel32.GetLastError()
+        if last_error == ERROR_ALREADY_EXISTS:
+            raise SystemExit(0)
+        _SINGLE_INSTANCE_MUTEX = handle
+    except SystemExit:
+        raise
+    except Exception as e:
+        _log(f"Single-instance lock failed: {e}")
 
 
 USER = getpass.getuser()
@@ -524,6 +637,44 @@ def save_first_page_only(input_path: str, output_path: str) -> None:
         writer.write(f_out)
 
 
+def _gdrive_get_credentials():
+    """Credenziali Google OAuth — stesso pattern dell'orchestratore FdA."""
+    if not _GDRIVE_AVAILABLE:
+        raise RuntimeError("Librerie Google non installate (pip install google-api-python-client google-auth).")
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    client_id     = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+    refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN", "").strip()
+    if not client_id or not client_secret or not refresh_token:
+        raise RuntimeError(
+            "Credenziali Google mancanti nel .env.\n"
+            "Copia GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET e GOOGLE_REFRESH_TOKEN\n"
+            "dal file .env dell'orchestratore FdA."
+        )
+    creds = Credentials(
+        token=None, refresh_token=refresh_token,
+        client_id=client_id, client_secret=client_secret,
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=_GDRIVE_SCOPES,
+    )
+    if not creds.valid:
+        creds.refresh(Request())
+    return creds
+
+
+def _gdrive_upload_to_inbox_pd(local_path: str, filename: str) -> str:
+    """Carica un PDF su GDrive nella cartella Inbox_PD. Restituisce l'ID file."""
+    if not GDRIVE_INBOX_PD_FOLDER_ID:
+        raise RuntimeError("GDRIVE_INBOX_PD_FOLDER_ID non configurato nel .env")
+    creds = _gdrive_get_credentials()
+    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    meta = {"name": filename, "parents": [GDRIVE_INBOX_PD_FOLDER_ID]}
+    media = MediaFileUpload(local_path, mimetype="application/pdf", resumable=False)
+    f = service.files().create(body=meta, media_body=media, fields="id").execute()
+    return f.get("id", "")
+
+
 def print_pdf(path: str, copies: int = 1) -> None:
     copies = max(1, int(copies or 1))
 
@@ -586,23 +737,23 @@ class MexalDaemonApp:
         tree = self.list_tree
         if not tree or not tree.winfo_exists():
             return
-
         try:
             for iid in list(tree.get_children()):
                 tree.delete(iid)
         except Exception:
             return
-
         docs = self._collect_last_docs(limit=5)
         for doc in docs:
-            created_str = time.strftime("%d/%m/%Y %H:%M:%S", time.localtime(doc.created_at))
+            created_str = time.strftime("%d/%m %H:%M", time.localtime(doc.created_at))
+            tag = doc.doc_code if doc.doc_code in _DOC_TAG_COLOR else "?"
             tree.insert(
-                "",
-                "end",
+                "", "end",
                 iid=self._doc_id(doc),
                 values=(doc.doc_code, doc.doc_type, doc.recipient, doc.doc_date, created_str),
+                tags=(tag,),
             )
-
+        for code, color in _DOC_TAG_COLOR.items():
+            tree.tag_configure(code, foreground=color)
         if tree.get_children():
             tree.selection_set(tree.get_children()[0])
             tree.event_generate("<<TreeviewSelect>>")
@@ -681,31 +832,74 @@ class MexalDaemonApp:
 
         win = tk.Toplevel(self.root)
         self.overlay = win
-        win.title("Nuovo documento Mexal")
+        win.title("Mexal — Nuovo documento")
         win.attributes("-topmost", True)
         win.resizable(False, False)
 
-        frm = ttk.Frame(win, padding=12)
-        frm.grid(row=0, column=0, sticky="nsew")
+        # Header colorato
+        hdr = ttk.Frame(win, bootstyle="primary", padding=(16, 10))
+        hdr.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            hdr,
+            text="📄  Nuovo documento Mexal",
+            font=("Segoe UI", 11, "bold"),
+            bootstyle="inverse-primary",
+        ).grid(row=0, column=0, sticky="w")
 
-        msg = (
-            "È stato emesso un nuovo documento.\n"
-            "Vuoi processarlo adesso?\n\n"
-            f"Tipo: {doc.doc_code} ({doc.doc_type})\n"
-            f"Destinatario: {doc.recipient}\n"
-        )
-        ttk.Label(frm, text=msg, justify="left").grid(row=0, column=0, columnspan=2, sticky="w")
+        # Body
+        body = ttk.Frame(win, padding=(20, 14, 20, 6))
+        body.grid(row=1, column=0, sticky="nsew")
+        body.columnconfigure(1, weight=1)
 
-        ttk.Button(frm, text="No", command=self._overlay_no).grid(row=1, column=0, sticky="ew", pady=(12, 0), padx=(0, 8))
-        ttk.Button(frm, text="Sì", command=self._overlay_yes).grid(row=1, column=1, sticky="ew", pady=(12, 0))
+        color = _DOC_BOOTSTYLE.get(doc.doc_code, "secondary")
+        ttk.Label(
+            body,
+            text=f"  {doc.doc_code}  ",
+            bootstyle=f"inverse-{color}",
+            font=("Segoe UI", 9, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 10))
+        ttk.Label(
+            body,
+            text=doc.recipient,
+            font=("Segoe UI", 11, "bold"),
+        ).grid(row=0, column=1, sticky="w")
+
+        if doc.doc_date:
+            ttk.Label(
+                body,
+                text=f"{doc.doc_type}  •  {doc.doc_date}",
+                font=("Segoe UI", 9),
+                bootstyle="secondary",
+            ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        ttk.Separator(body).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 8))
+
+        ttk.Label(
+            body,
+            text="Vuoi processarlo adesso?",
+            font=("Segoe UI", 10),
+        ).grid(row=3, column=0, columnspan=2, sticky="w")
+
+        # Bottoni
+        btn_row = ttk.Frame(win, padding=(20, 8, 20, 16))
+        btn_row.grid(row=2, column=0, sticky="ew")
+        btn_row.columnconfigure(0, weight=1)
+        btn_row.columnconfigure(1, weight=1)
+        ttk.Button(
+            btn_row, text="Ignora", bootstyle="secondary-outline",
+            command=self._overlay_no, width=14,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(
+            btn_row, text="✅  Processa", bootstyle="success",
+            command=self._overlay_yes, width=14,
+        ).grid(row=0, column=1, sticky="ew")
 
         win.update_idletasks()
-        w = win.winfo_width()
-        h = win.winfo_height()
+        w = max(win.winfo_reqwidth(), 360)
+        h = win.winfo_reqheight()
         x = int((win.winfo_screenwidth() - w) / 2)
         y = int((win.winfo_screenheight() - h) / 2)
         win.geometry(f"{w}x{h}+{x}+{y}")
-
         win.protocol("WM_DELETE_WINDOW", self._overlay_no)
 
     def _overlay_no(self):
@@ -735,16 +929,19 @@ class MexalDaemonApp:
         return chosen
 
     def _get_doc_state(self, doc_id: str) -> dict:
-        return self.state.setdefault("docs", {}).setdefault(
+        st = self.state.setdefault("docs", {}).setdefault(
             doc_id,
             {
                 "saved": False,
                 "printed": False,
                 "emailed": False,
+                "gdrive_uploaded": False,
                 "dest_path": "",
                 "meta": {},
             },
         )
+        st.setdefault("gdrive_uploaded", False)
+        return st
 
     def _show_list_window(self):
         if self.list_window and self.list_window.winfo_exists():
@@ -762,78 +959,141 @@ class MexalDaemonApp:
 
         win = tk.Toplevel(self.root)
         self.list_window = win
-        win.title("Documenti Mexal - ultimi")
+        win.title("Mexal — Documenti recenti")
         win.attributes("-topmost", True)
+        win.minsize(720, 320)
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(1, weight=1)
         try:
             win.deiconify()
             win.focus_force()
         except Exception:
             pass
 
-        main = ttk.Frame(win, padding=10)
-        main.grid(row=0, column=0, sticky="nsew")
+        # Header
+        hdr = ttk.Frame(win, bootstyle="primary", padding=(16, 10))
+        hdr.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            hdr,
+            text="📋  Documenti Mexal — ultimi 5",
+            font=("Segoe UI", 11, "bold"),
+            bootstyle="inverse-primary",
+        ).grid(row=0, column=0, sticky="w")
+
+        # Main frame
+        main = ttk.Frame(win, padding=(12, 10, 12, 12))
+        main.grid(row=1, column=0, sticky="nsew")
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(0, weight=1)
+
+        # Treeview con scrollbar
+        tree_wrap = ttk.Frame(main)
+        tree_wrap.grid(row=0, column=0, sticky="nsew")
+        tree_wrap.columnconfigure(0, weight=1)
 
         cols = ("tipo", "descr", "destinatario", "data_doc", "creato")
-        tree = ttk.Treeview(main, columns=cols, show="headings", height=6)
+        tree = ttk.Treeview(
+            tree_wrap, columns=cols, show="headings", height=6, bootstyle="primary",
+        )
         self.list_tree = tree
-        tree.heading("tipo", text="Tipo")
-        tree.heading("descr", text="Descrizione")
+
+        tree.heading("tipo",         text="Tipo",        anchor="center")
+        tree.heading("descr",        text="Descrizione")
         tree.heading("destinatario", text="Destinatario")
-        tree.heading("data_doc", text="Data doc")
-        tree.heading("creato", text="Creato")
+        tree.heading("data_doc",     text="Data",        anchor="center")
+        tree.heading("creato",       text="Rilevato",    anchor="center")
 
-        tree.column("tipo", width=60, stretch=False)
-        tree.column("descr", width=140, stretch=False)
+        tree.column("tipo",         width=62,  stretch=False, anchor="center")
+        tree.column("descr",        width=120, stretch=False)
         tree.column("destinatario", width=300, stretch=True)
-        tree.column("data_doc", width=100, stretch=False)
-        tree.column("creato", width=140, stretch=False)
+        tree.column("data_doc",     width=90,  stretch=False, anchor="center")
+        tree.column("creato",       width=120, stretch=False, anchor="center")
 
-        tree.grid(row=0, column=0, columnspan=4, sticky="nsew")
+        sb = ttk.Scrollbar(tree_wrap, orient="vertical", command=tree.yview, bootstyle="primary-round")
+        tree.configure(yscrollcommand=sb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
 
+        # Popola e applica colori per tipo
         docs = self._collect_last_docs(limit=5)
         for doc in docs:
-            created_str = time.strftime("%d/%m/%Y %H:%M:%S", time.localtime(doc.created_at))
+            created_str = time.strftime("%d/%m %H:%M", time.localtime(doc.created_at))
+            tag = doc.doc_code if doc.doc_code in _DOC_TAG_COLOR else "?"
             tree.insert(
-                "",
-                "end",
+                "", "end",
                 iid=self._doc_id(doc),
                 values=(doc.doc_code, doc.doc_type, doc.recipient, doc.doc_date, created_str),
+                tags=(tag,),
             )
+        for code, color in _DOC_TAG_COLOR.items():
+            tree.tag_configure(code, foreground=color)
 
         if tree.get_children():
             tree.selection_set(tree.get_children()[0])
 
-        btn_save = ttk.Button(main, text="1) Salva", command=lambda: self._action_save(tree))
-        btn_print = ttk.Button(main, text="2) Stampa", command=lambda: self._action_print(tree))
-        btn_email = ttk.Button(main, text="3) Email", command=lambda: self._action_email(tree))
-        btn_view = ttk.Button(main, text="4) Vedi", command=lambda: self._action_view(tree))
+        ttk.Separator(main).grid(row=1, column=0, sticky="ew", pady=(10, 8))
 
-        btn_save.grid(row=1, column=0, sticky="ew", pady=(10, 0), padx=(0, 6))
-        btn_print.grid(row=1, column=1, sticky="ew", pady=(10, 0), padx=(0, 6))
-        btn_email.grid(row=1, column=2, sticky="ew", pady=(10, 0), padx=(0, 6))
-        btn_view.grid(row=1, column=3, sticky="ew", pady=(10, 0))
+        # Riga pulsanti principali
+        btn_row1 = ttk.Frame(main)
+        btn_row1.grid(row=2, column=0, sticky="ew")
+        for i in range(4):
+            btn_row1.columnconfigure(i, weight=1)
+
+        btn_save  = ttk.Button(btn_row1, text="💾  Salva",   bootstyle="success",   command=lambda: self._action_save(tree))
+        btn_print = ttk.Button(btn_row1, text="🖨️  Stampa",  bootstyle="secondary", command=lambda: self._action_print(tree))
+        btn_email = ttk.Button(btn_row1, text="✉️  Email",   bootstyle="info",      command=lambda: self._action_email(tree))
+        btn_view  = ttk.Button(btn_row1, text="👁️  Vedi",    bootstyle="light",     command=lambda: self._action_view(tree))
+
+        btn_save.grid( row=0, column=0, sticky="ew", padx=(0, 4))
+        btn_print.grid(row=0, column=1, sticky="ew", padx=(0, 4))
+        btn_email.grid(row=0, column=2, sticky="ew", padx=(0, 4))
+        btn_view.grid( row=0, column=3, sticky="ew")
+
+        # Pulsante GDrive (seconda riga, full width)
+        gdrive_ok = (
+            _GDRIVE_AVAILABLE
+            and bool(GDRIVE_INBOX_PD_FOLDER_ID)
+            and bool(os.environ.get("GOOGLE_CLIENT_ID"))
+            and bool(os.environ.get("GOOGLE_REFRESH_TOKEN"))
+        )
+        btn_gdrive = ttk.Button(
+            main,
+            text="☁️  Invia a GDrive Inbox_PD (Procedura Documentale)",
+            bootstyle="primary-outline",
+            command=lambda: self._action_gdrive_pd(tree),
+        )
+        btn_gdrive.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        if not gdrive_ok:
+            btn_gdrive.state(["disabled"])
 
         def refresh_buttons(*_):
             sel = tree.selection()
             if not sel:
-                btn_save.state(["disabled"])
-                btn_print.state(["disabled"])
-                btn_email.state(["disabled"])
-                btn_view.state(["disabled"])
+                for b in (btn_save, btn_print, btn_email, btn_view, btn_gdrive):
+                    b.state(["disabled"])
                 return
 
             doc_id = sel[0]
             st = self._get_doc_state(doc_id)
-            if st.get("saved"):
-                btn_save.state(["disabled"])
-                btn_print.state(["!disabled"])
-                btn_email.state(["!disabled"])
-                btn_view.state(["!disabled"])
+            doc = self._find_doc_by_id(doc_id)
+
+            saved = st.get("saved", False)
+            btn_save.state(["disabled"] if saved else ["!disabled"])
+            btn_print.state(["!disabled"] if saved else ["disabled"])
+            btn_email.state(["!disabled"] if saved else ["disabled"])
+            btn_view.state(["!disabled"] if saved else ["disabled"])
+
+            # GDrive: abilita solo se DDT + credenziali ok + non già caricato
+            is_ddt = doc and doc.doc_code == "DDT"
+            already_uploaded = st.get("gdrive_uploaded", False)
+            if gdrive_ok and is_ddt and not already_uploaded:
+                btn_gdrive.state(["!disabled"])
+                btn_gdrive.configure(text="☁️  Invia a GDrive Inbox_PD (Procedura Documentale)")
+            elif already_uploaded:
+                btn_gdrive.state(["disabled"])
+                btn_gdrive.configure(text="✅  Già caricato su GDrive Inbox_PD")
             else:
-                btn_save.state(["!disabled"])
-                btn_print.state(["disabled"])
-                btn_email.state(["disabled"])
-                btn_view.state(["disabled"])
+                btn_gdrive.state(["disabled"])
 
         tree.bind("<<TreeviewSelect>>", refresh_buttons)
         refresh_buttons()
@@ -1220,6 +1480,72 @@ class MexalDaemonApp:
         tree.event_generate("<<TreeviewSelect>>")
         messagebox.showinfo("Email", "Email inviata.")
 
+    def _dialog_dopo_gdrive(self, filename: str) -> None:
+        dlg = tk.Toplevel(self.root)
+        dlg.title("GDrive — Caricamento completato")
+        dlg.attributes("-topmost", True)
+        dlg.resizable(False, False)
+
+        # Header
+        hdr = ttk.Frame(dlg, bootstyle="success", padding=(16, 10))
+        hdr.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            hdr,
+            text="☁️  DDT caricato su GDrive Inbox_PD",
+            font=("Segoe UI", 11, "bold"),
+            bootstyle="inverse-success",
+        ).grid(row=0, column=0, sticky="w")
+
+        # Body
+        body = ttk.Frame(dlg, padding=(20, 14, 20, 6))
+        body.grid(row=1, column=0, sticky="nsew")
+
+        ttk.Label(
+            body,
+            text=filename,
+            font=("Segoe UI", 9),
+            bootstyle="secondary",
+        ).grid(row=0, column=0, sticky="w")
+
+        ttk.Separator(body).grid(row=1, column=0, sticky="ew", pady=(10, 8))
+
+        ttk.Label(
+            body,
+            text="Quando hai contattato il cliente e sei pronto,\navvia la Procedura Documentale dal bot Telegram.",
+            font=("Segoe UI", 10),
+            justify="left",
+        ).grid(row=2, column=0, sticky="w")
+
+        # Bottoni
+        btn_row = ttk.Frame(dlg, padding=(20, 10, 20, 16))
+        btn_row.grid(row=2, column=0, sticky="ew")
+        btn_row.columnconfigure(0, weight=1)
+        btn_row.columnconfigure(1, weight=1)
+
+        def _apri_telegram():
+            import urllib.parse
+            import webbrowser
+            testo = urllib.parse.quote("nuova procedura")
+            webbrowser.open(f"tg://resolve?domain={TELEGRAM_BOT_USERNAME}&text={testo}")
+            dlg.destroy()
+
+        ttk.Button(
+            btn_row, text="Lo faccio dopo", bootstyle="secondary-outline",
+            command=dlg.destroy, width=16,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(
+            btn_row, text="📱  Avvia ora su Telegram", bootstyle="success",
+            command=_apri_telegram, width=24,
+        ).grid(row=0, column=1, sticky="ew")
+
+        dlg.update_idletasks()
+        w = max(dlg.winfo_reqwidth(), 400)
+        h = dlg.winfo_reqheight()
+        x = int((dlg.winfo_screenwidth() - w) / 2)
+        y = int((dlg.winfo_screenheight() - h) / 2)
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+        dlg.grab_set()
+
     def _action_view(self, tree: ttk.Treeview):
         sel = tree.selection()
         if not sel:
@@ -1233,19 +1559,72 @@ class MexalDaemonApp:
         except Exception as e:
             messagebox.showerror("Errore", f"Impossibile aprire il file:\n{e}")
 
+    def _action_gdrive_pd(self, tree: ttk.Treeview):
+        sel = tree.selection()
+        if not sel:
+            return
+        doc_id = sel[0]
+        doc = self._find_doc_by_id(doc_id)
+        if not doc:
+            messagebox.showerror("Errore", "Documento non trovato.")
+            return
+
+        # Costruisce il nome file con la stessa convenzione del salvataggio locale
+        numero = (doc.doc_number or "").strip()
+        dest = (doc.recipient or "").strip()
+        data = (doc.doc_date or "").strip()
+        parts = [p for p in [numero, dest, data] if p] or ["DDT"]
+        filename = re.sub(r"[\\/:*?\"<>|]", "-", " ".join(parts)) + ".pdf"
+        filename = re.sub(r"\s+", " ", filename)
+
+        try:
+            file_id = _gdrive_upload_to_inbox_pd(doc.source_path, filename)
+            _log(f"GDrive upload OK: {filename} → id={file_id}")
+        except Exception as e:
+            _log(f"GDrive upload FAIL: {e}")
+            messagebox.showerror("Errore GDrive", str(e))
+            return
+
+        st = self._get_doc_state(doc_id)
+        st["gdrive_uploaded"] = True
+        _save_json(STATE_FILE, self.state)
+        tree.event_generate("<<TreeviewSelect>>")
+        self._dialog_dopo_gdrive(filename)
+
+
+def _is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _relaunch_as_admin() -> None:
+    """Rilancia lo script corrente con UAC (ShellExecute runas)."""
+    script = os.path.abspath(__file__)
+    args   = " ".join(f'"{a}"' for a in sys.argv[1:])
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{script}" {args}', None, 1)
+
 
 if __name__ == "__main__":
     if "--install-startup" in sys.argv:
+        if not _is_admin():
+            _relaunch_as_admin()
+            raise SystemExit(0)
         install_windows_shortcuts()
-        print("OK: collegamenti creati (Startup + Desktop).")
+        print("OK: task schedulati (MexalDaemon + MexalWatchdog) e collegamento Desktop creati.")
         raise SystemExit(0)
 
     if "--uninstall-startup" in sys.argv:
+        if not _is_admin():
+            _relaunch_as_admin()
+            raise SystemExit(0)
         uninstall_windows_shortcuts()
-        print("OK: collegamenti rimossi (Startup + Desktop).")
+        print("OK: task rimossi e collegamento Desktop eliminato.")
         raise SystemExit(0)
 
-    root = tk.Tk()
-    ttk.Style().theme_use("clam")
+    _ensure_single_instance("MexalAutomationDaemon")
+
+    root = ttk.Window(themename="flatly")
     MexalDaemonApp(root)
     root.mainloop()
