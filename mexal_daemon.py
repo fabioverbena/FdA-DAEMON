@@ -203,6 +203,25 @@ def _tg_notify(doc: "ParsedDoc", doc_id: str, is_espositore: bool) -> None:
     threading.Thread(target=_send, daemon=True).start()
 
 
+def _tg_send_simple(text: str) -> None:
+    """Invia un messaggio Telegram semplice (no bottoni) in thread background."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_NOTIFY_CHAT_ID:
+        return
+    payload = {"chat_id": TELEGRAM_NOTIFY_CHAT_ID, "text": text}
+    def _send() -> None:
+        try:
+            data = json.dumps(payload).encode()
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                data=data,
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            _log(f"Telegram FAIL (simple): {e}")
+    threading.Thread(target=_send, daemon=True).start()
+
+
 def send_email_smtp(
     *,
     host: str,
@@ -886,6 +905,14 @@ class MexalDaemonApp:
                     if dest is not None:
                         is_esp = doc.doc_code == "DDT" and _is_espositore_ddt(doc.source_path)
                         _tg_notify(doc, doc_id, is_esp)
+                        if is_esp and _GDRIVE_AVAILABLE and GDRIVE_INBOX_PD_FOLDER_ID \
+                                and os.environ.get("GOOGLE_CLIENT_ID") \
+                                and os.environ.get("GOOGLE_REFRESH_TOKEN"):
+                            threading.Thread(
+                                target=self._do_gdrive_upload_bg,
+                                args=(doc, doc_id),
+                                daemon=True,
+                            ).start()
                 self._show_overlay(new_docs[0])
         except Exception as e:
             _log(f"Tick error (#{self._tick_count}): {e}")
@@ -1619,6 +1646,37 @@ class MexalDaemonApp:
         st["gdrive_uploaded"] = True
         _save_json(STATE_FILE, self.state)
         self._dialog_dopo_gdrive(filename)
+
+    def _do_gdrive_upload_bg(self, doc: "ParsedDoc", doc_id: str) -> None:
+        """Upload GDrive in background thread — nessuna messagebox, safe da thread."""
+        st = self._get_doc_state(doc_id)
+        if st.get("gdrive_uploaded"):
+            return
+        dest_path = st.get("dest_path") or doc.source_path
+        if not dest_path or not os.path.isfile(dest_path):
+            _log(f"GDrive auto-upload: file non trovato: {dest_path}")
+            return
+        numero   = (doc.doc_number or "").strip()
+        dest     = (doc.recipient  or "").strip()
+        data_doc = (doc.doc_date   or "").strip()
+        parts    = [p for p in [numero, dest, data_doc] if p] or ["DDT"]
+        filename = re.sub(r"[\\/:*?\"<>|]", "-", " ".join(parts)) + ".pdf"
+        filename = re.sub(r"\s+", " ", filename)
+        try:
+            file_id = _gdrive_upload_to_inbox_pd(dest_path, filename)
+            _log(f"GDrive auto-upload OK: {filename} → id={file_id}")
+            st["gdrive_uploaded"] = True
+            _save_json(STATE_FILE, self.state)
+            _tg_send_simple(
+                f"☁️ GDrive Inbox\\_PD ✅\n"
+                f"{doc.doc_type} {doc.doc_number} — {dest[:40]}"
+            )
+        except Exception as e:
+            _log(f"GDrive auto-upload FAIL: {e}")
+            _tg_send_simple(
+                f"⚠️ GDrive upload fallito\n"
+                f"{doc.doc_type} {doc.doc_number}: {str(e)[:80]}"
+            )
 
     def _do_spedizione(self, doc: "ParsedDoc", doc_id: str, spedizioni_url: str) -> None:
         try:
