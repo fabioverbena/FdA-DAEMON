@@ -8,7 +8,10 @@ import shutil
 import re
 import subprocess
 import ctypes
+import threading
 import urllib.parse
+import urllib.request
+import webbrowser
 import smtplib
 import ssl
 import sys
@@ -106,11 +109,98 @@ def _load_dotenv(env_path: str) -> None:
 
 DOTENV_PATH = os.path.join(_app_dir(), ".env")
 _load_dotenv(DOTENV_PATH)
+_load_dotenv(os.path.join(_app_dir(), "local.env"))
 
 GDRIVE_CREDENTIALS        = os.environ.get("GDRIVE_CREDENTIALS", "").strip()
 GDRIVE_INBOX_PD_FOLDER_ID = os.environ.get("GDRIVE_INBOX_PD_FOLDER_ID", "").strip()
 TELEGRAM_BOT_USERNAME     = os.environ.get("TELEGRAM_BOT_USERNAME", "FdA_AutoBOT_bot").strip()
+TELEGRAM_BOT_TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_NOTIFY_CHAT_ID   = os.environ.get("TELEGRAM_NOTIFY_CHAT_ID", "").strip()
 _GDRIVE_SCOPES            = ["https://www.googleapis.com/auth/drive"]
+
+# Codici articolo Mexal degli espositori refrigerati — propone Procedura Documentale come default
+_ESPOSITORE_CODES: set[str] = {"FDA-002", "FDA-003", "FDA-004", "FDA-045", "FDA-014"}
+
+
+def _is_espositore_ddt(pdf_path: str) -> bool:
+    """Ritorna True se il DDT contiene almeno un espositore (per codice o parola chiave)."""
+    try:
+        reader = PdfReader(pdf_path)
+        text = " ".join(page.extract_text() or "" for page in reader.pages).upper()
+        if "ESPOSITORE" in text:
+            return True
+        for code in _ESPOSITORE_CODES:
+            if code.upper() in text:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_trasporto_vettore(pdf_path: str) -> bool:
+    """Ritorna True se il DDT riporta 'VETTORE' come mezzo di trasporto."""
+    try:
+        reader = PdfReader(pdf_path)
+        text = " ".join(page.extract_text() or "" for page in reader.pages).upper()
+        return "VETTORE" in text
+    except Exception:
+        return False
+
+
+_TG_DOC_EMOJI: dict[str, str] = {
+    "DDT": "📦", "FC": "🧾", "PC": "📋", "OC": "📥", "OF": "📤",
+}
+
+
+def _tg_notify(doc: "ParsedDoc", doc_id: str, is_espositore: bool) -> None:
+    """Invia notifica Telegram con bottoni inline — HTTP in thread background, non blocca tkinter."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_NOTIFY_CHAT_ID:
+        return
+
+    emoji = _TG_DOC_EMOJI.get(doc.doc_code, "📄")
+    num_str  = f" n°{doc.doc_number}" if doc.doc_number else ""
+    date_str = f" — {doc.doc_date}"   if doc.doc_date   else ""
+    esp_str  = " (Espositore)"        if is_espositore   else ""
+
+    text = (
+        f"{emoji} {doc.doc_type}{num_str}{date_str}\n"
+        f"{doc.recipient}{esp_str}\n"
+        f"Salvato locale ✅"
+    )
+
+    if doc.doc_code == "DDT" and is_espositore:
+        buttons = [[
+            {"text": "\U0001f5a8️ Stampa DDT",     "callback_data": f"stampa_ddt:{doc_id}"},
+            {"text": "\U0001f4cb Avvia Procedura", "callback_data": f"avvia_procedura:{doc_id}"},
+        ]]
+    elif doc.doc_code == "DDT":
+        buttons = [[
+            {"text": "\U0001f5a8️ Stampa DDT",      "callback_data": f"stampa_ddt:{doc_id}"},
+            {"text": "\U0001f4e6 Nuova Spedizione", "callback_data": f"nuova_spedizione:{doc_id}"},
+        ]]
+    else:
+        buttons = None
+
+    payload: dict = {"chat_id": TELEGRAM_NOTIFY_CHAT_ID, "text": text}
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": buttons}
+
+    def _send() -> None:
+        try:
+            data = json.dumps(payload).encode()
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                data=data,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode())
+            msg_id = result.get("result", {}).get("message_id", "?")
+            _log(f"Telegram: msg_id={msg_id} {doc.doc_type} {doc.doc_number} {doc.recipient[:40]}")
+        except Exception as e:
+            _log(f"Telegram FAIL: {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
 
 
 def send_email_smtp(
@@ -302,12 +392,12 @@ def _ensure_single_instance(mutex_name: str) -> None:
 
 
 USER = getpass.getuser()
-BASE_PATH = os.path.join("C:/Users", USER, "Desktop", "AMMINISTRAZIONE_2025")
-BOLLE_DIR = os.path.join(BASE_PATH, "BOLLE_2025")
-FATTURE_DIR = os.path.join(BASE_PATH, "FATTURE_2025")
-PREVENTIVI_DIR = os.path.join(BASE_PATH, "PREVENTIVI_2025")
-ORDINI_DIR = os.path.join(BASE_PATH, "ORDINI_2025")
-ORDINI_FORNITORI_DIR = os.path.join(BASE_PATH, "ORDINI FORNITORI_2025")
+_BASE_PATH_DEFAULT = os.path.join("C:/Users", USER, "Desktop", "AMMINISTRAZIONE_2025")
+BOLLE_DIR            = os.environ.get("BOLLE_DIR")            or os.path.join(_BASE_PATH_DEFAULT, "BOLLE_2025")
+FATTURE_DIR          = os.environ.get("FATTURE_DIR")          or os.path.join(_BASE_PATH_DEFAULT, "FATTURE_2025")
+PREVENTIVI_DIR       = os.environ.get("PREVENTIVI_DIR")       or os.path.join(_BASE_PATH_DEFAULT, "PREVENTIVI_2025")
+ORDINI_DIR           = os.environ.get("ORDINI_DIR")           or os.path.join(_BASE_PATH_DEFAULT, "ORDINI_2025")
+ORDINI_FORNITORI_DIR = os.environ.get("ORDINI_FORNITORI_DIR") or os.path.join(_BASE_PATH_DEFAULT, "ORDINI FORNITORI_2025")
 
 PATHS = {
     # descrizioni
@@ -406,6 +496,9 @@ class ParsedDoc:
     doc_number: str
     doc_date: str
     recipient: str
+    dest_cap: str = ""
+    dest_citta: str = ""
+    dest_provincia: str = ""
 
 
 def _load_json(path: str, default):
@@ -451,12 +544,15 @@ _HEADER_RE = re.compile(
 )
 
 _DOCNUM_RE = re.compile(
-    r"\b(?:n\s*[\.:°º]?|nr\s*[\.:°º]?)\s*(?P<num>[0-9/]+)\b",
+    r"\b(?:n\s*[\.:°º]?|nr\s*[\.:°º]?)\s*(?P<num>[0-9]+(?:\s*/\s*[0-9]+)?)\b",
     re.IGNORECASE,
 )
 _DOCDATE_RE = re.compile(
-    r"\b(?:del|data)\b\.?\s*(?P<data>\d{2}[\./-]\d{2}[\./-]\d{4})\b",
+    r"\b(?:del|data)(?=[\s\d])\.?\s*(?P<data>\d{2}[\./-]\d{2}[\./-]\d{4})\b",
     re.IGNORECASE,
+)
+_ADDR_RE = re.compile(
+    r"(?P<cap>\d{5})\s+(?P<citta>[A-ZÀ-Ü][A-ZÀ-Ü\s'\.]+?)\s+(?P<prov>[A-Z]{2,3})\b"
 )
 _ANYDATE_RE = re.compile(r"\b(?P<data>\d{2}[\./-]\d{2}[\./-]\d{4})\b")
 _NUM_AFTER_N_RE = re.compile(r"\bn\b[^0-9]*(?P<num>[0-9/]+)", re.IGNORECASE)
@@ -618,6 +714,20 @@ def parse_mexal_pdf(pdf_path: str) -> Optional[ParsedDoc]:
             if m_dup:
                 recipient = m_dup.group("a").strip()
 
+    # Estrai CAP / Città / Provincia dalle righe dopo il destinatario
+    dest_cap = dest_citta = dest_provincia = ""
+    if dest_idx is not None:
+        for ln in lines[dest_idx + 1 : dest_idx + 14]:
+            m_addr = _ADDR_RE.search(ln)
+            if m_addr:
+                dest_cap = m_addr.group("cap")
+                dest_citta = m_addr.group("citta").strip()
+                dest_provincia = m_addr.group("prov").upper()
+                break
+
+    # Normalizza numero: rimuove spazi interni (es. "3/ 61" → "3/61")
+    doc_number = re.sub(r"\s+", "", doc_number)
+
     return ParsedDoc(
         source_path=pdf_path,
         created_at=mtime,
@@ -626,6 +736,9 @@ def parse_mexal_pdf(pdf_path: str) -> Optional[ParsedDoc]:
         doc_number=doc_number,
         doc_date=doc_date,
         recipient=recipient,
+        dest_cap=dest_cap,
+        dest_citta=dest_citta,
+        dest_provincia=dest_provincia,
     )
 
 
@@ -761,17 +874,30 @@ class MexalDaemonApp:
     def _tick(self):
         try:
             self._tick_count += 1
+            if self._tick_count == 1:
+                _log("Tick loop started")
             new_docs = self._scan_for_new_docs()
             if new_docs:
                 self._last_detected = new_docs
                 self._current_doc = new_docs[0]
+                for doc in new_docs:
+                    doc_id = self._doc_id(doc)
+                    dest = self._do_save(doc, doc_id)
+                    if dest is not None:
+                        is_esp = doc.doc_code == "DDT" and _is_espositore_ddt(doc.source_path)
+                        _tg_notify(doc, doc_id, is_esp)
                 self._show_overlay(new_docs[0])
+        except Exception as e:
+            _log(f"Tick error (#{self._tick_count}): {e}")
         finally:
-            self.root.after(1000, self._tick)
+            try:
+                self.root.after(1000, self._tick)
+            except Exception as e:
+                _log(f"After error: {e}")
 
     def _scan_for_new_docs(self) -> list[ParsedDoc]:
         if not os.path.isdir(MEXAL_TEMP):
-            if self._tick_count % 10 == 0:
+            if self._tick_count == 1 or self._tick_count % 10 == 0:
                 _log(f"Scan: MEXAL_TEMP non esiste: {MEXAL_TEMP}")
             return []
 
@@ -787,7 +913,7 @@ class MexalDaemonApp:
 
         pdfs.sort(key=lambda x: x[1], reverse=True)
 
-        if self._tick_count % 10 == 0:
+        if self._tick_count == 1 or self._tick_count % 10 == 0:
             _log(f"Scan: found_pdfs={len(pdfs)} (showing up to 20)")
 
         parsed: list[ParsedDoc] = []
@@ -909,7 +1035,19 @@ class MexalDaemonApp:
 
     def _overlay_yes(self):
         self._overlay_no()
-        self._show_list_window()
+        doc = self._current_doc
+        if not doc:
+            return
+        doc_id = self._doc_id(doc)
+        dest_path = self._do_save(doc, doc_id)
+        if dest_path is None:
+            return
+        if doc.doc_code == "DDT":
+            is_esp = _is_espositore_ddt(doc.source_path)
+            is_vettore = _is_trasporto_vettore(doc.source_path)
+            self._dialog_ddt_azione(doc, doc_id, is_esp, is_vettore)
+        else:
+            messagebox.showinfo("Completato", f"Documento salvato in:\n{dest_path}")
 
     def _doc_id(self, doc: ParsedDoc) -> str:
         base = os.path.basename(doc.source_path)
@@ -1066,10 +1204,20 @@ class MexalDaemonApp:
         if not gdrive_ok:
             btn_gdrive.state(["disabled"])
 
+        # Pulsante Spedizione (terza riga, full width)
+        spedizioni_ok = True  # app locale sempre disponibile
+        btn_spedizione = ttk.Button(
+            main,
+            text="📦  Nuova Spedizione",
+            bootstyle="success-outline",
+            command=lambda: self._action_nuova_spedizione(tree),
+        )
+        btn_spedizione.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+
         def refresh_buttons(*_):
             sel = tree.selection()
             if not sel:
-                for b in (btn_save, btn_print, btn_email, btn_view, btn_gdrive):
+                for b in (btn_save, btn_print, btn_email, btn_view, btn_gdrive, btn_spedizione):
                     b.state(["disabled"])
                 return
 
@@ -1094,6 +1242,17 @@ class MexalDaemonApp:
                 btn_gdrive.configure(text="✅  Già caricato su GDrive Inbox_PD")
             else:
                 btn_gdrive.state(["disabled"])
+
+            # Spedizione: abilita solo se DDT + non già inviato
+            already_shipped = st.get("spedizione_creata", False)
+            if is_ddt and not already_shipped:
+                btn_spedizione.state(["!disabled"])
+                btn_spedizione.configure(text="📦  Nuova Spedizione")
+            elif already_shipped:
+                btn_spedizione.state(["disabled"])
+                btn_spedizione.configure(text="✅  Spedizione già creata")
+            else:
+                btn_spedizione.state(["disabled"])
 
         tree.bind("<<TreeviewSelect>>", refresh_buttons)
         refresh_buttons()
@@ -1141,22 +1300,13 @@ class MexalDaemonApp:
                 return d
         return None
 
-    def _action_save(self, tree: ttk.Treeview):
-        sel = tree.selection()
-        if not sel:
-            return
-        doc_id = sel[0]
-        doc = self._find_doc_by_id(doc_id)
-        if not doc:
-            messagebox.showerror("Errore", "Documento non trovato.")
-            return
-
+    def _do_save(self, doc: "ParsedDoc", doc_id: str) -> Optional[str]:
+        """Salva il documento in locale. Ritorna il percorso di destinazione o None in caso di errore."""
         st = self._get_doc_state(doc_id)
         if st.get("saved"):
-            return
+            return st.get("dest_path", "")
 
         save_dir = self._preferred_save_dir(doc)
-        _log(f"ActionSave: doc_code={doc.doc_code} doc_type={doc.doc_type} number={doc.doc_number} dest={save_dir}")
         os.makedirs(save_dir, exist_ok=True)
 
         numero = (doc.doc_number or "").strip()
@@ -1168,16 +1318,11 @@ class MexalDaemonApp:
         elif doc.doc_code in {"PC", "FC"}:
             parts = [numero, intestatario]
         else:
-            # Default: tipo documento; numero; intestatario; data documento
             tipo = (doc.doc_code or "?").strip()
             parts = [tipo, numero, intestatario, data_doc]
 
-        parts = [p for p in parts if p]
-        if not parts:
-            parts = ["Documento"]
-
-        filename = " ".join(parts) + ".pdf"
-        filename = re.sub(r"[\\/:*?\"<>|]", "-", filename)
+        parts = [p for p in parts if p] or ["Documento"]
+        filename = re.sub(r"[\\/:*?\"<>|]", "-", " ".join(parts)) + ".pdf"
         filename = re.sub(r"\s+", " ", filename)
         dest_path = os.path.join(save_dir, filename)
 
@@ -1188,7 +1333,7 @@ class MexalDaemonApp:
                 shutil.copy2(doc.source_path, dest_path)
         except Exception as e:
             messagebox.showerror("Errore", f"Errore durante il salvataggio:\n{e}")
-            return
+            return None
 
         st["saved"] = True
         st["dest_path"] = dest_path
@@ -1202,9 +1347,326 @@ class MexalDaemonApp:
             "created_at": doc.created_at,
         }
         _save_json(STATE_FILE, self.state)
+        return dest_path
 
-        messagebox.showinfo("Completato", f"Documento salvato in:\n{dest_path}")
-        tree.event_generate("<<TreeviewSelect>>")
+    def _dialog_ddt_azione(self, doc: "ParsedDoc", doc_id: str, is_espositore: bool, is_vettore: bool) -> None:
+        """Dopo il salvataggio di un DDT, gestisce i 3 casi:
+        - non-espositore → Spedizione default
+        - espositore + vettore → Procedura default
+        - espositore + non vettore → chiede stampa → Procedura
+        """
+        # Caso 3: espositore consegnato direttamente (non vettore) → stampa + procedura
+        if is_espositore and not is_vettore:
+            self._dialog_espositore_diretto(doc, doc_id)
+            return
+
+        gdrive_ok = (
+            _GDRIVE_AVAILABLE
+            and bool(GDRIVE_INBOX_PD_FOLDER_ID)
+            and bool(os.environ.get("GOOGLE_CLIENT_ID"))
+            and bool(os.environ.get("GOOGLE_REFRESH_TOKEN"))
+        )
+        spedizioni_url = os.environ.get("SPEDIZIONI_API_URL", "http://localhost:8000")
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("DDT salvato — Prossimo passo")
+        dlg.attributes("-topmost", True)
+        dlg.resizable(False, False)
+
+        hdr = ttk.Frame(dlg, bootstyle="success", padding=(16, 10))
+        hdr.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            hdr,
+            text="✅  DDT salvato in locale",
+            font=("Segoe UI", 11, "bold"),
+            bootstyle="inverse-success",
+        ).grid(row=0, column=0, sticky="w")
+
+        body = ttk.Frame(dlg, padding=(20, 14, 20, 6))
+        body.grid(row=1, column=0, sticky="nsew")
+
+        # Caso 1: non-espositore → default Spedizione
+        # Caso 2: espositore + vettore → default Procedura
+        if is_espositore:
+            hint = "Rilevato espositore — consigliata Procedura Documentale"
+        else:
+            hint = "DDT standard — consigliata Nuova Spedizione"
+        ttk.Label(body, text=hint, font=("Segoe UI", 10)).grid(row=0, column=0, sticky="w", pady=(0, 4))
+
+        addr_parts = [p for p in [doc.dest_cap, doc.dest_citta, doc.dest_provincia] if p]
+        if addr_parts:
+            addr_str = f"{doc.dest_cap} {doc.dest_citta} ({doc.dest_provincia})"
+            ttk.Label(body, text=addr_str, font=("Segoe UI", 9), bootstyle="secondary").grid(
+                row=1, column=0, sticky="w", pady=(0, 8)
+            )
+
+        btn_row = ttk.Frame(dlg, padding=(20, 8, 20, 4))
+        btn_row.grid(row=2, column=0, sticky="ew")
+        btn_row.columnconfigure(0, weight=1)
+        btn_row.columnconfigure(1, weight=1)
+
+        def do_procedura():
+            dlg.destroy()
+            self._do_save(doc, doc_id)
+            if not gdrive_ok:
+                messagebox.showerror("GDrive", "Credenziali Google non configurate.")
+                return
+            self._do_gdrive_upload(doc, doc_id)
+
+        def do_spedizione():
+            dlg.destroy()
+            self._do_save(doc, doc_id)
+            self._do_spedizione(doc, doc_id, spedizioni_url)
+
+        proc_style = "primary" if is_espositore else "primary-outline"
+        sped_style = "success-outline" if is_espositore else "success"
+
+        ttk.Button(
+            btn_row, text="☁️  Procedura Documentale",
+            bootstyle=proc_style, command=do_procedura, width=22,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(
+            btn_row, text="📦  Nuova Spedizione",
+            bootstyle=sped_style, command=do_spedizione, width=22,
+        ).grid(row=0, column=1, sticky="ew")
+
+        btn_row2 = ttk.Frame(dlg, padding=(20, 0, 20, 12))
+        btn_row2.grid(row=3, column=0, sticky="ew")
+        btn_row2.columnconfigure(0, weight=1)
+        btn_row2.columnconfigure(1, weight=1)
+
+        def do_stampa():
+            copies = self._ask_copies()
+            if copies is None:
+                return
+            st_doc = self._get_doc_state(doc_id)
+            dest = st_doc.get("dest_path", "")
+            if not dest:
+                messagebox.showerror("Errore", "Documento non ancora salvato.")
+                return
+            try:
+                print_pdf(dest, copies=copies)
+                st_doc["printed"] = True
+                _save_json(STATE_FILE, self.state)
+            except Exception as exc:
+                messagebox.showerror("Errore stampa", str(exc))
+
+        def do_email():
+            st_doc = self._get_doc_state(doc_id)
+            dest = st_doc.get("dest_path", "")
+            if not dest:
+                messagebox.showerror("Errore", "Documento non ancora salvato.")
+                return
+            fields = self._ask_email(doc)
+            if not fields:
+                return
+            to_addr = fields.get("to", "").strip()
+            subject = fields.get("subject", "").strip()
+            body_text = fields.get("body", "").strip()
+            to_addrs = [a.strip() for a in re.split(r"[;,\s]+", to_addr) if a.strip()]
+            if not to_addrs:
+                messagebox.showwarning("Attenzione", "Inserisci un destinatario valido.")
+                return
+            cfg = _smtp_config()
+            host = str(cfg.get("host") or "").strip()
+            port = int(cfg.get("port") or 0)
+            user = str(cfg.get("user") or "").strip()
+            password = str(cfg.get("password") or "").strip()
+            from_addr = str(cfg.get("from_addr") or "").strip()
+            if not host or not port or not user or not password:
+                ok = self._smtp_settings_wizard()
+                if not ok:
+                    return
+                cfg = _smtp_config()
+                host = str(cfg.get("host") or "").strip()
+                port = int(cfg.get("port") or 0)
+                user = str(cfg.get("user") or "").strip()
+                password = str(cfg.get("password") or "").strip()
+                from_addr = str(cfg.get("from_addr") or "").strip()
+            try:
+                send_email_smtp(
+                    host=host, port=port, user=user, password=password,
+                    from_addr=from_addr, to_addrs=to_addrs,
+                    subject=subject, body=body_text,
+                    attachment_path=os.path.abspath(dest),
+                )
+                st_doc["emailed"] = True
+                _save_json(STATE_FILE, self.state)
+                messagebox.showinfo("Email", "Email inviata.")
+            except Exception as exc:
+                messagebox.showerror("Errore email", str(exc))
+
+        ttk.Button(
+            btn_row2, text="🖨️  Stampa",
+            bootstyle="warning-outline", command=do_stampa, width=22,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(
+            btn_row2, text="📧  Invia Email",
+            bootstyle="info-outline", command=do_email, width=22,
+        ).grid(row=0, column=1, sticky="ew")
+
+        ttk.Button(
+            dlg, text="Chiudi",
+            bootstyle="secondary-link",
+            command=dlg.destroy,
+        ).grid(row=4, column=0, pady=(0, 8))
+
+        dlg.update_idletasks()
+        w = max(dlg.winfo_reqwidth(), 420)
+        h = dlg.winfo_reqheight()
+        x = int((dlg.winfo_screenwidth() - w) / 2)
+        y = int((dlg.winfo_screenheight() - h) / 2)
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _dialog_espositore_diretto(self, doc: "ParsedDoc", doc_id: str) -> None:
+        """Espositore consegnato direttamente (non vettore): chiede stampa DDT poi avvia Procedura."""
+        gdrive_ok = (
+            _GDRIVE_AVAILABLE
+            and bool(GDRIVE_INBOX_PD_FOLDER_ID)
+            and bool(os.environ.get("GOOGLE_CLIENT_ID"))
+            and bool(os.environ.get("GOOGLE_REFRESH_TOKEN"))
+        )
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Espositore — consegna diretta")
+        dlg.attributes("-topmost", True)
+        dlg.resizable(False, False)
+
+        hdr = ttk.Frame(dlg, bootstyle="warning", padding=(16, 10))
+        hdr.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            hdr,
+            text="🏪  Espositore — consegna diretta",
+            font=("Segoe UI", 11, "bold"),
+            bootstyle="inverse-warning",
+        ).grid(row=0, column=0, sticky="w")
+
+        body = ttk.Frame(dlg, padding=(20, 14, 20, 6))
+        body.grid(row=1, column=0, sticky="nsew")
+        ttk.Label(
+            body,
+            text="Trasporto non a vettore.\nVuoi stampare il DDT prima di avviare la Procedura Documentale?",
+            font=("Segoe UI", 10),
+            justify="left",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 12))
+
+        btn_row = ttk.Frame(dlg, padding=(20, 8, 20, 16))
+        btn_row.grid(row=2, column=0, sticky="ew")
+        btn_row.columnconfigure(0, weight=1)
+        btn_row.columnconfigure(1, weight=1)
+
+        def do_stampa_poi_procedura():
+            dlg.destroy()
+            copies = self._ask_copies()
+            if copies is not None:
+                st = self._get_doc_state(doc_id)
+                dest = st.get("dest_path") or doc.source_path
+                try:
+                    print_pdf(dest, copies=copies)
+                    st["printed"] = True
+                    _save_json(STATE_FILE, self.state)
+                except Exception as e:
+                    messagebox.showerror("Errore stampa", str(e))
+            if gdrive_ok:
+                self._do_gdrive_upload(doc, doc_id)
+            else:
+                messagebox.showerror("GDrive", "Credenziali Google non configurate.")
+
+        def do_solo_procedura():
+            dlg.destroy()
+            if gdrive_ok:
+                self._do_gdrive_upload(doc, doc_id)
+            else:
+                messagebox.showerror("GDrive", "Credenziali Google non configurate.")
+
+        ttk.Button(
+            btn_row, text="🖨️  Stampa + Procedura",
+            bootstyle="warning", command=do_stampa_poi_procedura, width=22,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(
+            btn_row, text="☁️  Solo Procedura",
+            bootstyle="primary-outline", command=do_solo_procedura, width=22,
+        ).grid(row=0, column=1, sticky="ew")
+
+        ttk.Button(
+            dlg, text="Solo salvataggio — chiudi",
+            bootstyle="secondary-link",
+            command=dlg.destroy,
+        ).grid(row=3, column=0, pady=(0, 8))
+
+        dlg.update_idletasks()
+        w = max(dlg.winfo_reqwidth(), 420)
+        h = dlg.winfo_reqheight()
+        x = int((dlg.winfo_screenwidth() - w) / 2)
+        y = int((dlg.winfo_screenheight() - h) / 2)
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _do_gdrive_upload(self, doc: "ParsedDoc", doc_id: str) -> None:
+        numero = (doc.doc_number or "").strip()
+        dest = (doc.recipient or "").strip()
+        data = (doc.doc_date or "").strip()
+        parts = [p for p in [numero, dest, data] if p] or ["DDT"]
+        filename = re.sub(r"[\\/:*?\"<>|]", "-", " ".join(parts)) + ".pdf"
+        filename = re.sub(r"\s+", " ", filename)
+        try:
+            file_id = _gdrive_upload_to_inbox_pd(doc.source_path, filename)
+            _log(f"GDrive upload OK: {filename} → id={file_id}")
+        except Exception as e:
+            _log(f"GDrive upload FAIL: {e}")
+            messagebox.showerror("Errore GDrive", str(e))
+            return
+        st = self._get_doc_state(doc_id)
+        st["gdrive_uploaded"] = True
+        _save_json(STATE_FILE, self.state)
+        self._dialog_dopo_gdrive(filename)
+
+    def _do_spedizione(self, doc: "ParsedDoc", doc_id: str, spedizioni_url: str) -> None:
+        try:
+            boundary = "----FormBoundary7MA4YWxkTrZu0gW"
+            with open(doc.source_path, "rb") as f:
+                pdf_data = f.read()
+            filename = os.path.basename(doc.source_path)
+            body = (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                f"Content-Type: application/pdf\r\n\r\n"
+            ).encode() + pdf_data + f"\r\n--{boundary}--\r\n".encode()
+            req = urllib.request.Request(
+                f"{spedizioni_url}/api/spedizioni/da-ddt?draft=true",
+                data=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read().decode())
+            spedizione_id = result.get("id") or result.get("spedizione_id") or result.get("data", {}).get("id")
+            _log(f"Spedizione bozza creata: id={spedizione_id}")
+        except Exception as e:
+            _log(f"Spedizione FAIL: {e}")
+            messagebox.showerror("Errore Spedizione", str(e))
+            return
+        st = self._get_doc_state(doc_id)
+        st["spedizione_creata"] = True
+        _save_json(STATE_FILE, self.state)
+        if spedizione_id:
+            webbrowser.open(f"{spedizioni_url}/?spedizione={spedizione_id}")
+        else:
+            webbrowser.open(spedizioni_url)
+        messagebox.showinfo("Spedizione creata", "✅ Bozza spedizione creata.\n\nIl browser si è aperto per completare i dettagli.")
+
+    def _action_save(self, tree: ttk.Treeview):
+        sel = tree.selection()
+        if not sel:
+            return
+        doc_id = sel[0]
+        doc = self._find_doc_by_id(doc_id)
+        if not doc:
+            messagebox.showerror("Errore", "Documento non trovato.")
+            return
+        dest_path = self._do_save(doc, doc_id)
+        if dest_path:
+            messagebox.showinfo("Completato", f"Documento salvato in:\n{dest_path}")
+            tree.event_generate("<<TreeviewSelect>>")
 
     def _action_print(self, tree: ttk.Treeview):
         sel = tree.selection()
@@ -1568,28 +2030,23 @@ class MexalDaemonApp:
         if not doc:
             messagebox.showerror("Errore", "Documento non trovato.")
             return
-
-        # Costruisce il nome file con la stessa convenzione del salvataggio locale
-        numero = (doc.doc_number or "").strip()
-        dest = (doc.recipient or "").strip()
-        data = (doc.doc_date or "").strip()
-        parts = [p for p in [numero, dest, data] if p] or ["DDT"]
-        filename = re.sub(r"[\\/:*?\"<>|]", "-", " ".join(parts)) + ".pdf"
-        filename = re.sub(r"\s+", " ", filename)
-
-        try:
-            file_id = _gdrive_upload_to_inbox_pd(doc.source_path, filename)
-            _log(f"GDrive upload OK: {filename} → id={file_id}")
-        except Exception as e:
-            _log(f"GDrive upload FAIL: {e}")
-            messagebox.showerror("Errore GDrive", str(e))
-            return
-
-        st = self._get_doc_state(doc_id)
-        st["gdrive_uploaded"] = True
-        _save_json(STATE_FILE, self.state)
+        self._do_save(doc, doc_id)
+        self._do_gdrive_upload(doc, doc_id)
         tree.event_generate("<<TreeviewSelect>>")
-        self._dialog_dopo_gdrive(filename)
+
+    def _action_nuova_spedizione(self, tree: ttk.Treeview):
+        sel = tree.selection()
+        if not sel:
+            return
+        doc_id = sel[0]
+        doc = self._find_doc_by_id(doc_id)
+        if not doc:
+            messagebox.showerror("Errore", "Documento non trovato.")
+            return
+        self._do_save(doc, doc_id)
+        spedizioni_url = os.environ.get("SPEDIZIONI_API_URL", "http://localhost:8000")
+        self._do_spedizione(doc, doc_id, spedizioni_url)
+        tree.event_generate("<<TreeviewSelect>>")
 
 
 def _is_admin() -> bool:

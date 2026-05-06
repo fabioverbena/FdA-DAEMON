@@ -7,14 +7,60 @@ import getpass
 import shutil
 from PyPDF2 import PdfReader, PdfWriter
 
+
+def _fattura_prefix_numero(numero: str) -> str:
+    numero = (numero or "").strip()
+    if not numero:
+        return numero
+    if numero.startswith("13-"):
+        return numero
+    return f"13-{numero}"
+
+
+def _load_dotenv(env_path: str) -> None:
+    try:
+        if not os.path.isfile(env_path):
+            return
+        with open(env_path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if not k:
+                    continue
+                if os.environ.get("DOTENV_OVERRIDE", "").strip().lower() in {"1", "true", "yes", "y"}:
+                    os.environ[k] = v
+                else:
+                    os.environ.setdefault(k, v)
+    except Exception:
+        return
+
 # Configurazioni
 USER = getpass.getuser()
+
+_load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+os.environ["DOTENV_OVERRIDE"] = "1"
+_load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "local.env"))
+os.environ.pop("DOTENV_OVERRIDE", None)
+
 BASE_PATH = os.path.join("C:/Users", USER, "Desktop", "AMMINISTRAZIONE_2025")
+_DEFAULT_FATTURE_DIR = os.path.join(BASE_PATH, "FATTURE_2025")
+_DEFAULT_BOLLE_DIR = os.path.join(BASE_PATH, "BOLLE_2025")
+
+FATTURE_DIR = os.environ.get("FATTURE_DIR", "").strip() or _DEFAULT_FATTURE_DIR
+BOLLE_DIR = os.environ.get("BOLLE_DIR", "").strip() or _DEFAULT_BOLLE_DIR
+
 PATHS = {
-    "Fattura": os.path.join(BASE_PATH, "FATTURE_2025"),
-    "Bolla": os.path.join(BASE_PATH, "BOLLE_2025")
+    "Fattura": FATTURE_DIR,
+    "Bolla": BOLLE_DIR,
 }
-MEXAL_TEMP = r"C:\Passepartout\PassClient\mxdesk1205143000\temp"
+
+MEXAL_TEMP = os.environ.get("MEXAL_TEMP", "").strip() or r"C:\Passepartout\PassClient\mxdesk1205143000\temp"
 TRACK_FILE = "progressivo_documenti.json"
 
 def load_tracking():
@@ -121,6 +167,10 @@ class App:
 
         save_dir = PATHS[tipo]
         os.makedirs(save_dir, exist_ok=True)
+
+        if tipo == "Fattura":
+            numero = _fattura_prefix_numero(numero)
+
         filename = f"{numero} {cliente}.pdf"
         dest_path = os.path.join(save_dir, filename)
 

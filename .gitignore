@@ -20,7 +20,18 @@ mexal_daemon.log
 # PyInstaller
 build/
 dist/
+dist_v*/
 *.spec
+
+# Configurazione locale con credenziali
+local.env
+
+# Repo annidato (ha il proprio git)
+fda-orchestrator/
+
+# Artefatti sistema
+%TEMP%/
+.claude/
 
 # file accidentali
 SMTP_USER=*.txt
