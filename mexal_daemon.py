@@ -518,6 +518,8 @@ class ParsedDoc:
     dest_cap: str = ""
     dest_citta: str = ""
     dest_provincia: str = ""
+    dest_tel: str = ""
+    dest_email: str = ""
 
 
 def _load_json(path: str, default):
@@ -576,6 +578,15 @@ _ADDR_RE = re.compile(
 _ANYDATE_RE = re.compile(r"\b(?P<data>\d{2}[\./-]\d{2}[\./-]\d{4})\b")
 _NUM_AFTER_N_RE = re.compile(r"\bn\b[^0-9]*(?P<num>[0-9/]+)", re.IGNORECASE)
 _SERIES_PROG_RE = re.compile(r"\b(?P<serie>\d+)\s*/\s*(?P<prog>\d+)\b")
+# Telefono + email sulla stessa riga (formato Mexal: "Tel.0541 123 Mail info@azienda.it")
+_TEL_MAIL_RE = re.compile(
+    r"Tel\.?\s*(?P<tel>[\d][\d\s\+\-\/\.]{3,}?)\s+Mail\s*(?P<email>[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})",
+    re.IGNORECASE,
+)
+_TEL_ONLY_RE = re.compile(
+    r"Tel\.?\s*(?P<tel>[\d][\d\s\+\-\/\.]{4,}?)(?:\s|$)",
+    re.IGNORECASE,
+)
 
 
 def _doc_code_from_lines(lines: list[str]) -> tuple[str, str]:
@@ -747,6 +758,20 @@ def parse_mexal_pdf(pdf_path: str) -> Optional[ParsedDoc]:
     # Normalizza numero: rimuove spazi interni (es. "3/ 61" → "3/61")
     doc_number = re.sub(r"\s+", "", doc_number)
 
+    # Estrai telefono e email — salta DDT Grenke (numero di contatto Grenke, non del cliente)
+    dest_tel = dest_email = ""
+    is_grenke = "grenke" in recipient.lower()
+    if not is_grenke:
+        for ln in lines:
+            m_tm = _TEL_MAIL_RE.search(ln)
+            if m_tm:
+                dest_tel   = re.sub(r"[\s\.]", "", m_tm.group("tel")).strip()
+                dest_email = m_tm.group("email").strip()
+                break
+            m_t = _TEL_ONLY_RE.search(ln)
+            if m_t and not dest_tel:
+                dest_tel = re.sub(r"[\s\.]", "", m_t.group("tel")).strip()
+
     return ParsedDoc(
         source_path=pdf_path,
         created_at=mtime,
@@ -758,6 +783,8 @@ def parse_mexal_pdf(pdf_path: str) -> Optional[ParsedDoc]:
         dest_cap=dest_cap,
         dest_citta=dest_citta,
         dest_provincia=dest_provincia,
+        dest_tel=dest_tel,
+        dest_email=dest_email,
     )
 
 
@@ -911,6 +938,12 @@ class MexalDaemonApp:
                             threading.Thread(
                                 target=self._do_gdrive_upload_bg,
                                 args=(doc, doc_id),
+                                daemon=True,
+                            ).start()
+                        if doc.doc_code == "DDT":
+                            threading.Thread(
+                                target=self._upsert_destinatario_bg,
+                                args=(doc,),
                                 daemon=True,
                             ).start()
                 self._show_overlay(new_docs[0])
@@ -1677,6 +1710,33 @@ class MexalDaemonApp:
                 f"⚠️ GDrive upload fallito\n"
                 f"{doc.doc_type} {doc.doc_number}: {str(e)[:80]}"
             )
+
+    def _upsert_destinatario_bg(self, doc: "ParsedDoc") -> None:
+        """UPSERT anagrafica destinatario nel DB Spedizioni — background thread."""
+        if not doc.recipient or doc.recipient == "(Destinatario non trovato)":
+            return
+        spedizioni_url = os.environ.get("SPEDIZIONI_API_URL", "http://localhost:8000")
+        payload: dict = {"nome": doc.recipient}
+        if doc.dest_cap:       payload["cap"]       = doc.dest_cap
+        if doc.dest_citta:     payload["citta"]     = doc.dest_citta
+        if doc.dest_provincia: payload["provincia"] = doc.dest_provincia
+        if doc.dest_email:     payload["email"]     = doc.dest_email
+        if doc.dest_tel:       payload["telefono"]  = doc.dest_tel
+        try:
+            data = json.dumps(payload).encode()
+            req = urllib.request.Request(
+                f"{spedizioni_url}/api/destinatari/upsert",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode())
+            action  = result.get("action", "?")
+            dest_id = result.get("destinatario_id", "?")
+            _log(f"Spedizioni UPSERT: {action} id={dest_id} nome={doc.recipient[:40]}")
+        except Exception as e:
+            _log(f"Spedizioni UPSERT FAIL: {e}")
 
     def _do_spedizione(self, doc: "ParsedDoc", doc_id: str, spedizioni_url: str) -> None:
         try:
