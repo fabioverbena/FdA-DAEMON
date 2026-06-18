@@ -179,7 +179,9 @@ def _tg_notify(doc: "ParsedDoc", doc_id: str, is_espositore: bool) -> None:
             {"text": "\U0001f4e6 Nuova Spedizione", "callback_data": f"nuova_spedizione:{doc_id}"},
         ]]
     else:
-        buttons = None
+        buttons = [[
+            {"text": "\U0001f5a8️ Stampa", "callback_data": f"stampa_doc:{doc_id}"},
+        ]]
 
     payload: dict = {"chat_id": TELEGRAM_NOTIFY_CHAT_ID, "text": text}
     if buttons:
@@ -500,8 +502,9 @@ def _detect_mexal_temp_dir() -> str:
 
 
 MEXAL_TEMP = _detect_mexal_temp_dir()
-STATE_FILE = "documenti_state.json"
-SEEN_FILE = "watcher_seen.json"
+_DAEMON_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(_DAEMON_DIR, "documenti_state.json")
+SEEN_FILE  = os.path.join(_DAEMON_DIR, "watcher_seen.json")
 
 _log(f"Startup. MEXAL_TEMP={MEXAL_TEMP}")
 
@@ -946,7 +949,8 @@ class MexalDaemonApp:
                                 args=(doc,),
                                 daemon=True,
                             ).start()
-                self._show_overlay(new_docs[0])
+                first_dest = self._get_doc_state(self._doc_id(new_docs[0])).get("dest_path") or None
+                self._show_overlay(new_docs[0], first_dest)
         except Exception as e:
             _log(f"Tick error (#{self._tick_count}): {e}")
         finally:
@@ -1011,25 +1015,29 @@ class MexalDaemonApp:
 
         return parsed
 
-    def _show_overlay(self, doc: ParsedDoc) -> None:
+    def _show_overlay(self, doc: ParsedDoc, dest_path: Optional[str] = None) -> None:
         if self.overlay and self.overlay.winfo_exists():
             self.overlay.lift()
             return
 
+        saved = bool(dest_path)
+
         win = tk.Toplevel(self.root)
         self.overlay = win
-        win.title("Mexal — Nuovo documento")
+        win.title("Mexal — Documento salvato" if saved else "Mexal — Nuovo documento")
         win.attributes("-topmost", True)
         win.resizable(False, False)
 
-        # Header colorato
-        hdr = ttk.Frame(win, bootstyle="primary", padding=(16, 10))
+        # Header
+        hdr_style = "success" if saved else "primary"
+        hdr_text  = "✅  Documento salvato automaticamente" if saved else "📄  Nuovo documento Mexal"
+        hdr = ttk.Frame(win, bootstyle=hdr_style, padding=(16, 10))
         hdr.grid(row=0, column=0, sticky="ew")
         ttk.Label(
             hdr,
-            text="📄  Nuovo documento Mexal",
+            text=hdr_text,
             font=("Segoe UI", 11, "bold"),
-            bootstyle="inverse-primary",
+            bootstyle=f"inverse-{hdr_style}",
         ).grid(row=0, column=0, sticky="w")
 
         # Body
@@ -1060,11 +1068,25 @@ class MexalDaemonApp:
 
         ttk.Separator(body).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 8))
 
-        ttk.Label(
-            body,
-            text="Vuoi processarlo adesso?",
-            font=("Segoe UI", 10),
-        ).grid(row=3, column=0, columnspan=2, sticky="w")
+        if saved:
+            folder = os.path.dirname(dest_path)
+            ttk.Label(
+                body,
+                text=f"📁  {folder}",
+                font=("Segoe UI", 9),
+                bootstyle="success",
+            ).grid(row=3, column=0, columnspan=2, sticky="w")
+            ttk.Label(
+                body,
+                text="Vuoi stamparlo o inviarlo per email?",
+                font=("Segoe UI", 10),
+            ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        else:
+            ttk.Label(
+                body,
+                text="Vuoi processarlo adesso?",
+                font=("Segoe UI", 10),
+            ).grid(row=3, column=0, columnspan=2, sticky="w")
 
         # Bottoni
         btn_row = ttk.Frame(win, padding=(20, 8, 20, 16))
@@ -1072,16 +1094,22 @@ class MexalDaemonApp:
         btn_row.columnconfigure(0, weight=1)
         btn_row.columnconfigure(1, weight=1)
         ttk.Button(
-            btn_row, text="Ignora", bootstyle="secondary-outline",
-            command=self._overlay_no, width=14,
+            btn_row,
+            text="Chiudi" if saved else "Ignora",
+            bootstyle="secondary-outline",
+            command=self._overlay_no,
+            width=14,
         ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
         ttk.Button(
-            btn_row, text="✅  Processa", bootstyle="success",
-            command=self._overlay_yes, width=14,
+            btn_row,
+            text="🖨️  Stampa / Email" if saved else "✅  Processa",
+            bootstyle="success",
+            command=self._overlay_yes,
+            width=16,
         ).grid(row=0, column=1, sticky="ew")
 
         win.update_idletasks()
-        w = max(win.winfo_reqwidth(), 360)
+        w = max(win.winfo_reqwidth(), 380)
         h = win.winfo_reqheight()
         x = int((win.winfo_screenwidth() - w) / 2)
         y = int((win.winfo_screenheight() - h) / 2)
@@ -1107,7 +1135,90 @@ class MexalDaemonApp:
             is_vettore = _is_trasporto_vettore(doc.source_path)
             self._dialog_ddt_azione(doc, doc_id, is_esp, is_vettore)
         else:
-            messagebox.showinfo("Completato", f"Documento salvato in:\n{dest_path}")
+            self._dialog_non_ddt(doc, doc_id, dest_path)
+
+    def _dialog_non_ddt(self, doc: ParsedDoc, doc_id: str, dest_path: str) -> None:
+        """Dialogo stampa copie per documenti non-DDT (FC, PC, OC, OF, ...)."""
+        color = _DOC_BOOTSTYLE.get(doc.doc_code, "primary")
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"{doc.doc_type} salvato — Stampa")
+        dlg.attributes("-topmost", True)
+        dlg.resizable(False, False)
+
+        hdr = ttk.Frame(dlg, bootstyle=color, padding=(16, 10))
+        hdr.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            hdr,
+            text=f"✅  {doc.doc_type} salvato in locale",
+            font=("Segoe UI", 11, "bold"),
+            bootstyle=f"inverse-{color}",
+        ).grid(row=0, column=0, sticky="w")
+
+        body = ttk.Frame(dlg, padding=(20, 14, 20, 6))
+        body.grid(row=1, column=0, sticky="nsew")
+
+        ttk.Label(
+            body,
+            text=doc.recipient,
+            font=("Segoe UI", 11, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+
+        if doc.doc_number:
+            ttk.Label(
+                body,
+                text=f"n° {doc.doc_number}  •  {doc.doc_date or ''}".strip(" •"),
+                font=("Segoe UI", 9),
+                bootstyle="secondary",
+            ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        ttk.Separator(body).grid(row=2, column=0, sticky="ew", pady=(12, 8))
+
+        ttk.Label(
+            body,
+            text="Quante copie stampo?",
+            font=("Segoe UI", 10),
+        ).grid(row=3, column=0, sticky="w", pady=(0, 10))
+
+        btn_copie = ttk.Frame(body)
+        btn_copie.grid(row=4, column=0, sticky="w")
+
+        def do_stampa(n: int) -> None:
+            dlg.destroy()
+            try:
+                print_pdf(dest_path, copies=n)
+                st = self._get_doc_state(doc_id)
+                st["printed"] = True
+                _save_json(STATE_FILE, self.state)
+            except Exception as exc:
+                messagebox.showerror("Errore stampa", str(exc))
+
+        for i, label in enumerate(["1 copia", "2 copie", "3 copie", "4 copie"]):
+            n = i + 1
+            ttk.Button(
+                btn_copie,
+                text=label,
+                bootstyle=color if i == 0 else f"{color}-outline",
+                command=lambda n=n: do_stampa(n),
+                width=10,
+            ).grid(row=0, column=i, padx=(0, 6))
+
+        footer = ttk.Frame(dlg, padding=(20, 4, 20, 14))
+        footer.grid(row=2, column=0, sticky="ew")
+        ttk.Button(
+            footer,
+            text="Salta stampa",
+            bootstyle="secondary-outline",
+            command=dlg.destroy,
+            width=14,
+        ).grid(row=0, column=0, sticky="w")
+
+        dlg.update_idletasks()
+        w = max(dlg.winfo_reqwidth(), 380)
+        h = dlg.winfo_reqheight()
+        x = int((dlg.winfo_screenwidth() - w) / 2)
+        y = int((dlg.winfo_screenheight() - h) / 2)
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
 
     def _doc_id(self, doc: ParsedDoc) -> str:
         base = os.path.basename(doc.source_path)
@@ -1767,9 +1878,9 @@ class MexalDaemonApp:
         st["spedizione_creata"] = True
         _save_json(STATE_FILE, self.state)
         if spedizione_id:
-            webbrowser.open(f"{spedizioni_url}/?spedizione={spedizione_id}")
+            webbrowser.open(f"{spedizioni_url}/?spedizione={spedizione_id}", new=2)
         else:
-            webbrowser.open(spedizioni_url)
+            webbrowser.open(spedizioni_url, new=2)
         messagebox.showinfo("Spedizione creata", "✅ Bozza spedizione creata.\n\nIl browser si è aperto per completare i dettagli.")
 
     def _action_save(self, tree: ttk.Treeview):
