@@ -1142,11 +1142,11 @@ class MexalDaemonApp:
             self._dialog_non_ddt(doc, doc_id, dest_path)
 
     def _dialog_non_ddt(self, doc: ParsedDoc, doc_id: str, dest_path: str) -> None:
-        """Dialogo stampa copie per documenti non-DDT (FC, PC, OC, OF, ...)."""
+        """Dialogo stampa/email per documenti non-DDT (FC, PC, OC, OF, ...)."""
         color = _DOC_BOOTSTYLE.get(doc.doc_code, "primary")
 
         dlg = tk.Toplevel(self.root)
-        dlg.title(f"{doc.doc_type} salvato — Stampa")
+        dlg.title(f"{doc.doc_type} salvato — Stampa / Email")
         dlg.attributes("-topmost", True)
         dlg.resizable(False, False)
 
@@ -1197,6 +1197,47 @@ class MexalDaemonApp:
             except Exception as exc:
                 messagebox.showerror("Errore stampa", str(exc))
 
+        def do_email() -> None:
+            fields = self._ask_email(doc)
+            if not fields:
+                return
+            to_addr = fields.get("to", "").strip()
+            subject = fields.get("subject", "").strip()
+            body_text = fields.get("body", "").strip()
+            to_addrs = [a.strip() for a in re.split(r"[;,\s]+", to_addr) if a.strip()]
+            if not to_addrs:
+                messagebox.showwarning("Attenzione", "Inserisci un destinatario valido.")
+                return
+            cfg = _smtp_config()
+            host = str(cfg.get("host") or "").strip()
+            port = int(cfg.get("port") or 0)
+            user = str(cfg.get("user") or "").strip()
+            password = str(cfg.get("password") or "").strip()
+            from_addr = str(cfg.get("from_addr") or "").strip()
+            if not host or not port or not user or not password:
+                ok = self._smtp_settings_wizard()
+                if not ok:
+                    return
+                cfg = _smtp_config()
+                host = str(cfg.get("host") or "").strip()
+                port = int(cfg.get("port") or 0)
+                user = str(cfg.get("user") or "").strip()
+                password = str(cfg.get("password") or "").strip()
+                from_addr = str(cfg.get("from_addr") or "").strip()
+            try:
+                send_email_smtp(
+                    host=host, port=port, user=user, password=password,
+                    from_addr=from_addr, to_addrs=to_addrs,
+                    subject=subject, body=body_text,
+                    attachment_path=os.path.abspath(dest_path),
+                )
+                st = self._get_doc_state(doc_id)
+                st["emailed"] = True
+                _save_json(STATE_FILE, self.state)
+                messagebox.showinfo("Email", "Email inviata.")
+            except Exception as exc:
+                messagebox.showerror("Errore email", str(exc))
+
         for i, label in enumerate(["1 copia", "2 copie", "3 copie", "4 copie"]):
             n = i + 1
             ttk.Button(
@@ -1209,13 +1250,22 @@ class MexalDaemonApp:
 
         footer = ttk.Frame(dlg, padding=(20, 4, 20, 14))
         footer.grid(row=2, column=0, sticky="ew")
+        footer.columnconfigure(0, weight=1)
+        footer.columnconfigure(1, weight=1)
         ttk.Button(
             footer,
-            text="Salta stampa",
+            text="Chiudi",
             bootstyle="secondary-outline",
             command=dlg.destroy,
             width=14,
-        ).grid(row=0, column=0, sticky="w")
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(
+            footer,
+            text="📧  Invia Email",
+            bootstyle="info-outline",
+            command=do_email,
+            width=16,
+        ).grid(row=0, column=1, sticky="ew")
 
         dlg.update_idletasks()
         w = max(dlg.winfo_reqwidth(), 380)
