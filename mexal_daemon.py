@@ -929,10 +929,13 @@ class MexalDaemonApp:
             if new_docs:
                 self._last_detected = new_docs
                 self._current_doc = new_docs[0]
+                first_dest: Optional[str] = None
                 for doc in new_docs:
                     doc_id = self._doc_id(doc)
                     dest = self._do_save(doc, doc_id)
                     if dest is not None:
+                        if doc is new_docs[0]:
+                            first_dest = dest
                         is_esp = doc.doc_code == "DDT" and _is_espositore_ddt(doc.source_path)
                         _tg_notify(doc, doc_id, is_esp)
                         if is_esp and _GDRIVE_AVAILABLE and GDRIVE_INBOX_PD_FOLDER_ID \
@@ -949,7 +952,7 @@ class MexalDaemonApp:
                                 args=(doc,),
                                 daemon=True,
                             ).start()
-                first_dest = self._get_doc_state(self._doc_id(new_docs[0])).get("dest_path") or None
+                _log(f"Overlay: first_dest={first_dest!r}")
                 self._show_overlay(new_docs[0], first_dest)
         except Exception as e:
             _log(f"Tick error (#{self._tick_count}): {e}")
@@ -1016,6 +1019,7 @@ class MexalDaemonApp:
         return parsed
 
     def _show_overlay(self, doc: ParsedDoc, dest_path: Optional[str] = None) -> None:
+        _log(f"ShowOverlay: dest_path={dest_path!r}")
         if self.overlay and self.overlay.winfo_exists():
             self.overlay.lift()
             return
