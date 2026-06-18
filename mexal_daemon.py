@@ -952,7 +952,6 @@ class MexalDaemonApp:
                                 args=(doc,),
                                 daemon=True,
                             ).start()
-                _log(f"Overlay: first_dest={first_dest!r}")
                 self._show_overlay(new_docs[0], first_dest)
         except Exception as e:
             _log(f"Tick error (#{self._tick_count}): {e}")
@@ -1019,7 +1018,6 @@ class MexalDaemonApp:
         return parsed
 
     def _show_overlay(self, doc: ParsedDoc, dest_path: Optional[str] = None) -> None:
-        _log(f"ShowOverlay: dest_path={dest_path!r}")
         if self.overlay and self.overlay.winfo_exists():
             self.overlay.lift()
             return
