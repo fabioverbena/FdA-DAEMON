@@ -844,16 +844,25 @@ def parse_mexal_pdf(pdf_path: str) -> Optional[ParsedDoc]:
                 dest_provincia = m_addr.group("prov").upper()
                 break
             if not dest_indirizzo:
-                dest_indirizzo = stripped
+                # Deduplicazione colonne Mexal: "Via Roma 1 Via Roma 1" → "Via Roma 1"
+                parts_ind = [p.strip() for p in re.split(r"\t+|\s{2,}", stripped) if p.strip()]
+                if len(parts_ind) >= 2 and parts_ind[0] == parts_ind[-1]:
+                    dest_indirizzo = parts_ind[0]
+                else:
+                    m_dup_ind = re.match(r"^(?P<a>.+?)\s+(?P=a)\s*$", stripped)
+                    dest_indirizzo = m_dup_ind.group("a").strip() if m_dup_ind else stripped
 
     # Normalizza numero: rimuove spazi interni (es. "3/ 61" → "3/61")
     doc_number = re.sub(r"\s+", "", doc_number)
 
-    # Estrai telefono e email — salta DDT Grenke (numero di contatto Grenke, non del cliente)
+    # Estrai telefono e email — cerca solo dopo la sezione destinatario per evitare
+    # di catturare i contatti di Fior d'Acqua dall'intestazione.
+    # Salta DDT Grenke (il numero presente sarebbe quello di Grenke, non del cliente).
     dest_tel = dest_email = ""
     is_grenke = "grenke" in recipient.lower()
+    tel_search_lines = lines[dest_idx:] if dest_idx is not None else lines
     if not is_grenke:
-        for ln in lines:
+        for ln in tel_search_lines:
             m_tm = _TEL_MAIL_RE.search(ln)
             if m_tm:
                 dest_tel   = re.sub(r"[\s\.]", "", m_tm.group("tel")).strip()
