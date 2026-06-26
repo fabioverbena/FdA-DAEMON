@@ -38,6 +38,17 @@ try:
 except ImportError:
     _GDRIVE_AVAILABLE = False
 
+# Mapping codici daemon → tipi CRM (Supabase)
+_CRM_TYPE_MAP: dict[str, str] = {
+    "DDT": "BC",   # BC/BC3 nel CRM
+    "FC":  "FTA",
+    "PC":  "PC",
+    "OC":  "OC",
+    "OF":  "OF",
+}
+_CLIENTE_CODES:   frozenset[str] = frozenset({"DDT", "FC", "PC", "OC"})
+_FORNITORE_CODES: frozenset[str] = frozenset({"OF"})
+
 # Colore badge per tipo documento
 _DOC_BOOTSTYLE: dict[str, str] = {
     "DDT": "success",
@@ -117,6 +128,17 @@ TELEGRAM_BOT_USERNAME     = os.environ.get("TELEGRAM_BOT_USERNAME", "FdA_AutoBOT
 TELEGRAM_BOT_TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_NOTIFY_CHAT_ID   = os.environ.get("TELEGRAM_NOTIFY_CHAT_ID", "").strip()
 _GDRIVE_SCOPES            = ["https://www.googleapis.com/auth/drive"]
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()  # service_role key
+
+_GENERA_DOCS_BAT_DEFAULT = os.path.join(
+    "C:\\Users", getpass.getuser(),
+    "Desktop", "FABIO APPLICAZIONI",
+    "GENERA_STAMPA_DOCUMENTI_PROCEDURA", "Templates",
+    "AVVIA GeneraDocumenti.bat",
+)
+GENERA_DOCUMENTI_BAT = os.environ.get("GENERA_DOCUMENTI_BAT", "").strip() or _GENERA_DOCS_BAT_DEFAULT
 
 # Codici articolo Mexal degli espositori refrigerati — propone Procedura Documentale come default
 _ESPOSITORE_CODES: set[str] = {"FDA-002", "FDA-003", "FDA-004", "FDA-045", "FDA-014"}
@@ -222,6 +244,34 @@ def _tg_send_simple(text: str) -> None:
         except Exception as e:
             _log(f"Telegram FAIL (simple): {e}")
     threading.Thread(target=_send, daemon=True).start()
+
+
+def _date_iso(date_str: str) -> str:
+    """Converte DD/MM/YYYY → YYYY-MM-DD per PostgreSQL. Ritorna stringa vuota se non parsabile."""
+    try:
+        d, m, y = date_str.strip().split("/")
+        return f"{y}-{m.zfill(2)}-{d.zfill(2)}"
+    except Exception:
+        return ""
+
+
+def _supabase_post(path: str, payload: dict, prefer: str = "resolution=merge-duplicates") -> None:
+    """POST a Supabase PostgREST. Lancia eccezione in caso di errore HTTP."""
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Prefer": prefer,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
 
 
 def send_email_smtp(
@@ -523,6 +573,7 @@ class ParsedDoc:
     dest_provincia: str = ""
     dest_tel: str = ""
     dest_email: str = ""
+    piva: str = ""
 
 
 def _load_json(path: str, default):
@@ -590,6 +641,13 @@ _TEL_ONLY_RE = re.compile(
     r"Tel\.?\s*(?P<tel>[\d][\d\s\+\-\/\.]{4,}?)(?:\s|$)",
     re.IGNORECASE,
 )
+# PIVA italiana: 11 cifre, preceduta da "P.IVA", "P.I.", "Partita IVA", "C.F." ecc.
+_PIVA_RE = re.compile(
+    r"(?:P\.?\s*I\.?\s*V\.?\s*A\.?|Partita\s+IVA|C\.F\.)\s*[:\.]?\s*(?:IT)?\s*(?P<piva>\d{11})",
+    re.IGNORECASE,
+)
+# PIVA di Fior d'Acqua in entrambi i formati che Mexal può stampare
+_FDA_PIVE: frozenset[str] = frozenset({"30911", "00000030911"})
 
 
 def _doc_code_from_lines(lines: list[str]) -> tuple[str, str]:
@@ -775,6 +833,17 @@ def parse_mexal_pdf(pdf_path: str) -> Optional[ParsedDoc]:
             if m_t and not dest_tel:
                 dest_tel = re.sub(r"[\s\.]", "", m_t.group("tel")).strip()
 
+    # Estrai PIVA del destinatario: cerca prima nella sezione destinatario,
+    # poi su tutto il testo. La PIVA del mittente (FDA) compare nell'intestazione
+    # nelle primissime righe, quindi la saltiamo cercando dall'indice dest_idx.
+    piva = ""
+    search_lines = lines[dest_idx:] if dest_idx is not None else lines
+    for ln in search_lines:
+        m_piva = _PIVA_RE.search(ln)
+        if m_piva and m_piva.group("piva") not in _FDA_PIVE:
+            piva = m_piva.group("piva")
+            break
+
     return ParsedDoc(
         source_path=pdf_path,
         created_at=mtime,
@@ -788,6 +857,7 @@ def parse_mexal_pdf(pdf_path: str) -> Optional[ParsedDoc]:
         dest_provincia=dest_provincia,
         dest_tel=dest_tel,
         dest_email=dest_email,
+        piva=piva,
     )
 
 
@@ -938,6 +1008,12 @@ class MexalDaemonApp:
                             first_dest = dest
                         is_esp = doc.doc_code == "DDT" and _is_espositore_ddt(doc.source_path)
                         _tg_notify(doc, doc_id, is_esp)
+                        if SUPABASE_URL and SUPABASE_KEY:
+                            threading.Thread(
+                                target=self._crm_upsert_bg,
+                                args=(doc, doc_id, dest),
+                                daemon=True,
+                            ).start()
                         if is_esp and _GDRIVE_AVAILABLE and GDRIVE_INBOX_PD_FOLDER_ID \
                                 and os.environ.get("GOOGLE_CLIENT_ID") \
                                 and os.environ.get("GOOGLE_REFRESH_TOKEN"):
@@ -1246,7 +1322,7 @@ class MexalDaemonApp:
                 width=10,
             ).grid(row=0, column=i, padx=(0, 6))
 
-        footer = ttk.Frame(dlg, padding=(20, 4, 20, 14))
+        footer = ttk.Frame(dlg, padding=(20, 4, 20, 4))
         footer.grid(row=2, column=0, sticky="ew")
         footer.columnconfigure(0, weight=1)
         footer.columnconfigure(1, weight=1)
@@ -1265,8 +1341,44 @@ class MexalDaemonApp:
             width=16,
         ).grid(row=0, column=1, sticky="ew")
 
+        # Pulsante Procedura CE — solo per Fatture
+        if doc.doc_code == "FC":
+            def do_procedura_ce() -> None:
+                bat = GENERA_DOCUMENTI_BAT
+                if not os.path.isfile(bat):
+                    messagebox.showerror(
+                        "Procedura CE",
+                        f"File non trovato:\n{bat}\n\n"
+                        "Verifica il percorso in GENERA_DOCUMENTI_BAT nel local.env",
+                    )
+                    return
+                try:
+                    subprocess.Popen(
+                        [bat],
+                        cwd=os.path.dirname(bat),
+                        creationflags=0x00000001,  # CREATE_BREAKAWAY_FROM_JOB — finestra separata
+                        shell=True,
+                    )
+                    st = self._get_doc_state(doc_id)
+                    st["procedura_ce_avviata"] = True
+                    _save_json(STATE_FILE, self.state)
+                    _log(f"Procedura CE avviata: {bat}")
+                    dlg.destroy()
+                except Exception as exc:
+                    messagebox.showerror("Errore", f"Impossibile avviare la Procedura CE:\n{exc}")
+
+            ce_frame = ttk.Frame(dlg, padding=(20, 0, 20, 14))
+            ce_frame.grid(row=3, column=0, sticky="ew")
+            ce_frame.columnconfigure(0, weight=1)
+            ttk.Button(
+                ce_frame,
+                text="📋  Avvia Procedura CE (Genera Documenti)",
+                bootstyle="warning",
+                command=do_procedura_ce,
+            ).grid(row=0, column=0, sticky="ew")
+
         dlg.update_idletasks()
-        w = max(dlg.winfo_reqwidth(), 380)
+        w = max(dlg.winfo_reqwidth(), 420)
         h = dlg.winfo_reqheight()
         x = int((dlg.winfo_screenwidth() - w) / 2)
         y = int((dlg.winfo_screenheight() - h) / 2)
@@ -1297,11 +1409,13 @@ class MexalDaemonApp:
                 "printed": False,
                 "emailed": False,
                 "gdrive_uploaded": False,
+                "crm_synced": False,
                 "dest_path": "",
                 "meta": {},
             },
         )
         st.setdefault("gdrive_uploaded", False)
+        st.setdefault("crm_synced", False)
         return st
 
     def _show_list_window(self):
@@ -1880,6 +1994,7 @@ class MexalDaemonApp:
             return
         spedizioni_url = os.environ.get("SPEDIZIONI_API_URL", "http://localhost:8000")
         payload: dict = {"nome": doc.recipient}
+        if doc.piva:           payload["piva"]      = doc.piva
         if doc.dest_cap:       payload["cap"]       = doc.dest_cap
         if doc.dest_citta:     payload["citta"]     = doc.dest_citta
         if doc.dest_provincia: payload["provincia"] = doc.dest_provincia
@@ -1900,6 +2015,74 @@ class MexalDaemonApp:
             _log(f"Spedizioni UPSERT: {action} id={dest_id} nome={doc.recipient[:40]}")
         except Exception as e:
             _log(f"Spedizioni UPSERT FAIL: {e}")
+
+    def _crm_upsert_bg(self, doc: "ParsedDoc", doc_id: str, dest_path: str) -> None:
+        """Upsert anagrafica + insert documento su Supabase CRM — background thread."""
+        st = self._get_doc_state(doc_id)
+        if st.get("crm_synced"):
+            return
+
+        crm_tipo = _CRM_TYPE_MAP.get(doc.doc_code)
+        if not crm_tipo:
+            _log(f"CRM: tipo non mappato '{doc.doc_code}', skip")
+            return
+
+        data_iso = _date_iso(doc.doc_date)
+        if not data_iso:
+            data_iso = datetime.now().strftime("%Y-%m-%d")
+            _log(f"CRM: data non parsabile '{doc.doc_date}', uso oggi")
+
+        try:
+            # Upsert anagrafica cliente
+            if doc.doc_code in _CLIENTE_CODES and doc.piva:
+                cliente: dict = {
+                    "piva":            doc.piva,
+                    "ragione_sociale": doc.recipient,
+                }
+                if doc.dest_cap:       cliente["cap"]             = doc.dest_cap
+                if doc.dest_citta:     cliente["comune"]          = doc.dest_citta
+                if doc.dest_provincia: cliente["sigla_provincia"] = doc.dest_provincia[:2].upper()
+                # email e telefono solo dai DDT (= BC/BC3 nel CRM)
+                if doc.doc_code == "DDT":
+                    if doc.dest_email: cliente["email"]    = doc.dest_email
+                    if doc.dest_tel:   cliente["telefono"] = doc.dest_tel
+                _supabase_post("clienti", cliente)
+                _log(f"CRM: clienti upsert OK piva={doc.piva} tipo={crm_tipo}")
+
+            # Upsert anagrafica fornitore
+            elif doc.doc_code in _FORNITORE_CODES and doc.piva:
+                fornitore: dict = {
+                    "piva":            doc.piva,
+                    "ragione_sociale": doc.recipient,
+                }
+                if doc.dest_cap:       fornitore["cap"]             = doc.dest_cap
+                if doc.dest_citta:     fornitore["comune"]          = doc.dest_citta
+                if doc.dest_provincia: fornitore["sigla_provincia"] = doc.dest_provincia[:2].upper()
+                if doc.dest_email:     fornitore["email"]           = doc.dest_email
+                if doc.dest_tel:       fornitore["telefono"]        = doc.dest_tel
+                _supabase_post("fornitori", fornitore)
+                _log(f"CRM: fornitori upsert OK piva={doc.piva} tipo={crm_tipo}")
+
+            # Insert documento
+            documento: dict = {
+                "numero_documento":    doc.doc_number,
+                "tipo":                crm_tipo,
+                "data_documento":      data_iso,
+                "percorso_pdf_locale": dest_path,
+            }
+            if doc.doc_code in _CLIENTE_CODES and doc.piva:
+                documento["piva_cliente"] = doc.piva
+            elif doc.doc_code in _FORNITORE_CODES and doc.piva:
+                documento["piva_fornitore"] = doc.piva
+
+            _supabase_post("documenti", documento, prefer="return=minimal")
+            _log(f"CRM: documenti insert OK tipo={crm_tipo} n={doc.doc_number}")
+
+            st["crm_synced"] = True
+            _save_json(STATE_FILE, self.state)
+
+        except Exception as e:
+            _log(f"CRM upsert FAIL tipo={crm_tipo} n={doc.doc_number}: {e}")
 
     def _do_spedizione(self, doc: "ParsedDoc", doc_id: str, spedizioni_url: str) -> None:
         try:
