@@ -135,13 +135,25 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()  # service_role key
 _GENERA_DOCS_BAT_DEFAULT = os.path.join(
     "C:\\Users", getpass.getuser(),
     "Desktop", "FABIO APPLICAZIONI",
-    "GENERA_STAMPA_DOCUMENTI_PROCEDURA", "Templates",
+    "GENERA-DOCUMENTAZIONE-PROCEDURA",
     "AVVIA GeneraDocumenti.bat",
 )
 GENERA_DOCUMENTI_BAT = os.environ.get("GENERA_DOCUMENTI_BAT", "").strip() or _GENERA_DOCS_BAT_DEFAULT
 
 # Codici articolo Mexal degli espositori refrigerati — propone Procedura Documentale come default
 _ESPOSITORE_CODES: set[str] = {"FDA-002", "FDA-003", "FDA-004", "FDA-045", "FDA-014"}
+
+# Carica articoli da CSV: {codice_uppercase: descrizione}
+_ARTICOLI_MAP: dict[str, str] = {}
+_ARTICOLI_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ARTICOLI_FDA.csv")
+try:
+    with open(_ARTICOLI_CSV, "r", encoding="cp1252") as _f:
+        for _line in _f:
+            _parts = _line.strip().split(";")
+            if len(_parts) >= 2 and _parts[0].strip() != "Codice":
+                _ARTICOLI_MAP[_parts[0].strip().upper()] = _parts[1].strip()
+except Exception:
+    pass
 
 
 def _is_espositore_ddt(pdf_path: str) -> bool:
@@ -571,9 +583,12 @@ class ParsedDoc:
     dest_cap: str = ""
     dest_citta: str = ""
     dest_provincia: str = ""
+    dest_indirizzo: str = ""
     dest_tel: str = ""
     dest_email: str = ""
     piva: str = ""
+    matricola: str = ""
+    modello: str = ""
 
 
 def _load_json(path: str, default):
@@ -648,6 +663,11 @@ _PIVA_RE = re.compile(
 )
 # PIVA di Fior d'Acqua in entrambi i formati che Mexal può stampare
 _FDA_PIVE: frozenset[str] = frozenset({"30911", "00000030911"})
+_MATRICOLA_RE = re.compile(
+    r"(?:Matricola|N[/.]?S[/.]?)\s*[:\.]?\s*(?P<matricola>\d+)",
+    re.IGNORECASE,
+)
+_ARTICOLO_CODE_RE = re.compile(r"\b(FDA[-]?[0-9A-Z][0-9A-Z\-]*)\b", re.IGNORECASE)
 
 
 def _doc_code_from_lines(lines: list[str]) -> tuple[str, str]:
@@ -805,16 +825,26 @@ def parse_mexal_pdf(pdf_path: str) -> Optional[ParsedDoc]:
             if m_dup:
                 recipient = m_dup.group("a").strip()
 
-    # Estrai CAP / Città / Provincia dalle righe dopo il destinatario
-    dest_cap = dest_citta = dest_provincia = ""
+    # Estrai CAP / Città / Provincia + indirizzo stradale dalle righe dopo il destinatario.
+    # L'indirizzo è la prima riga non-vuota dopo il nome destinatario che NON matcha _ADDR_RE.
+    dest_cap = dest_citta = dest_provincia = dest_indirizzo = ""
     if dest_idx is not None:
+        recipient_found = False
         for ln in lines[dest_idx + 1 : dest_idx + 14]:
-            m_addr = _ADDR_RE.search(ln)
+            stripped = ln.strip()
+            if not stripped:
+                continue
+            if not recipient_found:
+                recipient_found = True  # prima riga non-vuota = nome destinatario, già estratto
+                continue
+            m_addr = _ADDR_RE.search(stripped)
             if m_addr:
                 dest_cap = m_addr.group("cap")
                 dest_citta = m_addr.group("citta").strip()
                 dest_provincia = m_addr.group("prov").upper()
                 break
+            if not dest_indirizzo:
+                dest_indirizzo = stripped
 
     # Normalizza numero: rimuove spazi interni (es. "3/ 61" → "3/61")
     doc_number = re.sub(r"\s+", "", doc_number)
@@ -844,6 +874,25 @@ def parse_mexal_pdf(pdf_path: str) -> Optional[ParsedDoc]:
             piva = m_piva.group("piva")
             break
 
+    # Estrai matricola — cerca "Matricola:" o "N/S:" in tutto il testo
+    matricola = ""
+    for ln in lines:
+        m_mat = _MATRICOLA_RE.search(ln)
+        if m_mat:
+            matricola = m_mat.group("matricola").strip()
+            break
+
+    # Estrai modello — trova il primo codice FDA nel testo e risale alla descrizione
+    modello = ""
+    for ln in lines:
+        m_cod = _ARTICOLO_CODE_RE.search(ln)
+        if m_cod:
+            cod = m_cod.group(1).upper()
+            desc = _ARTICOLI_MAP.get(cod) or _ARTICOLI_MAP.get(re.sub(r"^(FDA)(\d)", r"\1-\2", cod))
+            if desc:
+                modello = desc
+                break
+
     return ParsedDoc(
         source_path=pdf_path,
         created_at=mtime,
@@ -852,12 +901,15 @@ def parse_mexal_pdf(pdf_path: str) -> Optional[ParsedDoc]:
         doc_number=doc_number,
         doc_date=doc_date,
         recipient=recipient,
+        dest_indirizzo=dest_indirizzo,
         dest_cap=dest_cap,
         dest_citta=dest_citta,
         dest_provincia=dest_provincia,
         dest_tel=dest_tel,
         dest_email=dest_email,
         piva=piva,
+        matricola=matricola,
+        modello=modello,
     )
 
 
@@ -1353,6 +1405,23 @@ class MexalDaemonApp:
                     )
                     return
                 try:
+                    prefill = {k: v for k, v in {
+                        "nomeAzienda": doc.recipient,
+                        "indirizzo":   doc.dest_indirizzo,
+                        "cap":         doc.dest_cap,
+                        "citta":       doc.dest_citta,
+                        "piva":        doc.piva,
+                        "email":       doc.dest_email,
+                        "matricola":   doc.matricola,
+                        "modello":     doc.modello,
+                    }.items() if v}
+                    prefill_path = os.path.join(os.path.dirname(bat), "prefill.json")
+                    try:
+                        with open(prefill_path, "w", encoding="utf-8") as _pf:
+                            json.dump(prefill, _pf, ensure_ascii=False, indent=2)
+                    except Exception as exc:
+                        _log(f"Prefill write error: {exc}")
+
                     subprocess.Popen(
                         [bat],
                         cwd=os.path.dirname(bat),
