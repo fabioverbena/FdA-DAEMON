@@ -9,6 +9,7 @@ import re
 import subprocess
 import ctypes
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -31,6 +32,12 @@ except Exception:
     win32com = None
 
 try:
+    import pdfplumber  # type: ignore
+    _PDFPLUMBER_AVAILABLE = True
+except ImportError:
+    _PDFPLUMBER_AVAILABLE = False
+
+try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload
@@ -45,9 +52,10 @@ _CRM_TYPE_MAP: dict[str, str] = {
     "PC":  "PC",
     "OC":  "OC",
     "OF":  "OF",
+    "BF":  "BF",   # Bolla Reso Fornitore
 }
 _CLIENTE_CODES:   frozenset[str] = frozenset({"DDT", "FC", "PC", "OC"})
-_FORNITORE_CODES: frozenset[str] = frozenset({"OF"})
+_FORNITORE_CODES: frozenset[str] = frozenset({"OF", "BF"})
 
 # Colore badge per tipo documento
 _DOC_BOOTSTYLE: dict[str, str] = {
@@ -66,6 +74,17 @@ _DOC_TAG_COLOR: dict[str, str] = {
     "OF":  "#6c757d",
     "?":   "#dc3545",
 }
+
+
+def _is_connection_refused(exc: BaseException) -> bool:
+    """True se l'eccezione indica che il server non è raggiungibile (porta chiusa/container giù)."""
+    if isinstance(exc, ConnectionRefusedError):
+        return True
+    if isinstance(exc, OSError) and getattr(exc, "winerror", None) == 10061:
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        return _is_connection_refused(exc.reason) if exc.reason else False
+    return False
 
 
 def _smtp_config() -> dict[str, object]:
@@ -154,6 +173,222 @@ try:
                 _ARTICOLI_MAP[_parts[0].strip().upper()] = _parts[1].strip()
 except Exception:
     pass
+
+
+def _lookup_regione(cap: str) -> tuple[str, str]:
+    """Cerca CAP in cap_comuni su Supabase. Ritorna (regione, provincia) o ('', '')."""
+    if not cap or not SUPABASE_URL or not SUPABASE_KEY:
+        return "", ""
+    try:
+        params = f"cap=eq.{urllib.parse.quote(cap)}&select=regione,provincia&limit=1"
+        rows = _supabase_get("cap_comuni", params)
+        if rows:
+            return rows[0].get("regione", ""), rows[0].get("provincia", "")
+    except Exception as e:
+        _log(f"cap_comuni lookup FAIL cap={cap}: {e}")
+    return "", ""
+
+
+def _classify_tipo_riga(codice: str, descrizione: str) -> str:
+    """Classifica riga documento: 'espositore' | 'ricambio' | 'servizio' | 'altro'."""
+    cod_up  = (codice or "").upper()
+    desc_up = (descrizione or "").upper()
+    if cod_up in {c.upper() for c in _ESPOSITORE_CODES}:
+        return "espositore"
+    if any(kw in desc_up for kw in ("ESPOSITORE", "LEONARDO", "TITANO", "ZEN")):
+        return "espositore"
+    _KW_SERV = {"INSTALLAZIONE", "ASSISTENZA", "TRASPORTO", "CONSEGNA", "VISIONE",
+                "GARANZIA", "CONTRATTO", "INTERVENTO", "MANUTENZIONE"}
+    if any(kw in desc_up for kw in _KW_SERV):
+        return "servizio"
+    return "ricambio"
+
+
+def _parse_float_it(s: str) -> Optional[float]:
+    """Converte numero formato italiano '1.234,56' → float. None se non parsabile."""
+    if not s:
+        return None
+    try:
+        return float(s.strip().replace(".", "").replace(",", "."))
+    except ValueError:
+        return None
+
+
+_IMPORTO_RE  = re.compile(r"^\d{1,3}(?:\.\d{3})*,\d{2}$|^\d+,\d{2}$")
+_QTA_RE      = re.compile(r"^\d+[,\.]\d{3}$")
+_RIGA_TXT_RE = re.compile(
+    r"^(?P<codice>[A-Z]{2,}[-]?[0-9][0-9A-Z\-]*)\s+"
+    r"(?P<descrizione>.+?)\s+"
+    r"(?:[A-Z]{2,3}\s+)?"
+    r"(?P<qta>\d+[,\.]\d{3})\s+"
+    r"(?P<pu>[\d\.]+,\d{2})\s+"
+    r"(?P<tot>[\d\.]+,\d{2})\s*$",
+    re.IGNORECASE,
+)
+_MATRICOLA_NOTE_RE = re.compile(
+    r"(?:Matricola|N[/.]?S[/.]?)\s*[:\.]?\s*(?P<mat>\d+)", re.IGNORECASE
+)
+
+
+def _parse_righe_pdfplumber(pdf_path: str) -> list[dict]:
+    """Estrae righe documento con pdfplumber (posizioni word). Best-effort."""
+    rows: list[dict] = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                words = page.extract_words(x_tolerance=3, y_tolerance=3)
+                if not words:
+                    continue
+
+                # Raggruppa parole per riga (bucket y da 3pt)
+                lines_map: dict[int, list[dict]] = {}
+                for w in words:
+                    y_key = round(w["top"] / 3) * 3
+                    lines_map.setdefault(y_key, []).append(w)
+
+                sorted_lines = sorted(lines_map.items())
+
+                # Trova intestazione tabella articoli
+                header_y = -1
+                col_codice = col_descr = col_qta = col_pu = col_tot = None
+                for y, wlist in sorted_lines:
+                    joined = " ".join(w["text"].lower() for w in wlist)
+                    if "codice" in joined and ("quantit" in joined or "importo" in joined):
+                        header_y = y
+                        for w in wlist:
+                            tl = w["text"].lower()
+                            x0 = w["x0"]
+                            if "codice" in tl:       col_codice = x0
+                            elif "descr" in tl:       col_descr  = x0
+                            elif "quantit" in tl:     col_qta    = x0
+                            elif "prezzo" in tl:      col_pu     = x0
+                            elif "importo" in tl or "totale" in tl: col_tot = x0
+                        break
+
+                if header_y < 0 or col_codice is None:
+                    continue
+
+                for y, wlist in sorted_lines:
+                    if y <= header_y:
+                        continue
+
+                    line_text = " ".join(w["text"] for w in wlist)
+
+                    # Riga nota/matricola
+                    m_mat = _MATRICOLA_NOTE_RE.search(line_text)
+                    if m_mat and rows:
+                        rows[-1]["note"]      = line_text.strip()
+                        rows[-1]["matricola"] = m_mat.group("mat")
+                        continue
+
+                    # La riga articolo inizia vicino a col_codice
+                    if not wlist or abs(wlist[0]["x0"] - col_codice) > 25:
+                        continue
+
+                    codice = descr_parts = ""
+                    qta_s = pu_s = tot_s = ""
+                    descr_list: list[str] = []
+
+                    for w in wlist:
+                        x0 = w["text"]
+                        x  = w["x0"]
+                        t  = w["text"]
+                        if col_descr and x < col_descr - 5:
+                            codice += t
+                        elif col_qta and col_pu and col_qta - 5 <= x < col_pu - 5:
+                            if _QTA_RE.match(t) or _IMPORTO_RE.match(t):
+                                qta_s = t
+                        elif col_pu and col_tot and col_pu - 5 <= x < col_tot - 5:
+                            if _IMPORTO_RE.match(t):
+                                pu_s = t
+                        elif col_tot and x >= col_tot - 5:
+                            if _IMPORTO_RE.match(t):
+                                tot_s = t
+                        elif col_descr and x >= col_descr - 5:
+                            descr_list.append(t)
+
+                    codice = codice.strip()
+                    if not codice:
+                        continue
+                    descrizione = " ".join(descr_list).strip()
+                    tipo = _classify_tipo_riga(codice, descrizione)
+                    rows.append({
+                        "codice_articolo": codice,
+                        "descrizione":     descrizione,
+                        "quantita":        _parse_float_it(qta_s),
+                        "prezzo_unitario": _parse_float_it(pu_s),
+                        "totale_riga":     _parse_float_it(tot_s),
+                        "note":            "",
+                        "matricola":       "",
+                        "tipo_riga":       tipo,
+                    })
+    except Exception as e:
+        _log(f"pdfplumber righe FAIL {pdf_path}: {e}")
+    return rows
+
+
+def _parse_righe_text(pdf_path: str) -> list[dict]:
+    """Fallback PyPDF2: estrae righe articolo da testo grezzo con regex."""
+    rows: list[dict] = []
+    try:
+        reader = PdfReader(pdf_path)
+        prev_codice = prev_descr = ""
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            for ln in text.splitlines():
+                stripped = ln.strip()
+                m = _RIGA_TXT_RE.match(stripped)
+                if m:
+                    codice      = m.group("codice")
+                    descrizione = m.group("descrizione").strip()
+                    tipo        = _classify_tipo_riga(codice, descrizione)
+                    rows.append({
+                        "codice_articolo": codice,
+                        "descrizione":     descrizione,
+                        "quantita":        _parse_float_it(m.group("qta")),
+                        "prezzo_unitario": _parse_float_it(m.group("pu")),
+                        "totale_riga":     _parse_float_it(m.group("tot")),
+                        "note":            "",
+                        "matricola":       "",
+                        "tipo_riga":       tipo,
+                    })
+                    continue
+                m_mat = _MATRICOLA_NOTE_RE.search(stripped)
+                if m_mat and rows:
+                    rows[-1]["note"]      = stripped
+                    rows[-1]["matricola"] = m_mat.group("mat")
+    except Exception as e:
+        _log(f"text righe FAIL {pdf_path}: {e}")
+    return rows
+
+
+def _parse_righe_documento(pdf_path: str) -> list[dict]:
+    """Estrae righe articolo dal PDF Mexal. Usa pdfplumber se disponibile."""
+    if _PDFPLUMBER_AVAILABLE:
+        rows = _parse_righe_pdfplumber(pdf_path)
+        if rows:
+            return rows
+    return _parse_righe_text(pdf_path)
+
+
+def _upsert_espositore(
+    matricola: str,
+    piva_cliente: str,
+    data_prima_vendita: str,
+) -> Optional[str]:
+    """Upsert espositore su Supabase. Ritorna UUID o None."""
+    if not matricola or not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    payload: dict = {"matricola": matricola}
+    if piva_cliente:       payload["piva_cliente"]       = piva_cliente
+    if data_prima_vendita: payload["data_prima_vendita"] = data_prima_vendita
+    try:
+        esp_id = _supabase_post_returning("espositori", payload)
+        _log(f"CRM: espositore upsert OK matricola={matricola} id={esp_id}")
+        return esp_id
+    except Exception as e:
+        _log(f"CRM: espositore upsert FAIL matricola={matricola}: {e}")
+    return None
 
 
 def _is_espositore_ddt(pdf_path: str) -> bool:
@@ -286,6 +521,62 @@ def _supabase_post(path: str, payload: dict, prefer: str = "resolution=merge-dup
         resp.read()
 
 
+def _supabase_post_returning(path: str, payload: dict) -> Optional[str]:
+    """POST con return=representation. Ritorna il campo 'id' del primo record o None."""
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url, data=data,
+        headers={
+            "Content-Type": "application/json",
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Prefer": "return=representation,resolution=merge-duplicates",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        result = json.loads(resp.read().decode())
+    if isinstance(result, list) and result:
+        return result[0].get("id")
+    return None
+
+
+def _supabase_get(path: str, params: str = "") -> list:
+    """GET da Supabase PostgREST. Ritorna lista di dict o [] in caso di errore."""
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    if params:
+        url += f"?{params}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _supabase_patch(path: str, params: str, payload: dict) -> None:
+    """PATCH a Supabase PostgREST (aggiorna record filtrati da params)."""
+    url = f"{SUPABASE_URL}/rest/v1/{path}?{params}"
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url, data=data,
+        headers={
+            "Content-Type": "application/json",
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Prefer": "return=minimal",
+        },
+        method="PATCH",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
+
+
 def send_email_smtp(
     *,
     host: str,
@@ -405,6 +696,53 @@ def _register_task_scheduler(task_name: str, exe: str, arguments: str, workdir: 
     _remove_file_silent(xml_path)
 
 
+def _register_task_scheduler_with_delay(task_name: str, exe: str, arguments: str, workdir: str, delay_seconds: int = 90) -> None:
+    """Registra un Task Scheduler al logon con delay configurabile (in secondi)."""
+    delay_iso = f"PT{delay_seconds}S"
+    xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>{delay_iso}</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{exe}</Command>
+      <Arguments>{arguments}</Arguments>
+      <WorkingDirectory>{workdir}</WorkingDirectory>
+    </Exec>
+  </Actions>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
+    <RestartOnFailure>
+      <Interval>PT2M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+  </Settings>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+</Task>"""
+    xml_path = os.path.join(os.environ.get("TEMP", "C:\\Temp"), f"{task_name}.xml")
+    with open(xml_path, "w", encoding="utf-16") as f:
+        f.write(xml)
+    result = subprocess.run(
+        ["schtasks", "/Create", "/TN", task_name, "/XML", xml_path, "/F"],
+        creationflags=0x08000000, capture_output=True,
+    )
+    if result.returncode != 0:
+        err = result.stderr.decode(errors="replace") or result.stdout.decode(errors="replace")
+        raise RuntimeError(f"schtasks fallito (rc={result.returncode}): {err.strip()}")
+    _remove_file_silent(xml_path)
+
+
 def install_windows_shortcuts() -> None:
     if getattr(sys, "frozen", False):
         exe = os.path.abspath(sys.executable)
@@ -431,6 +769,20 @@ def install_windows_shortcuts() -> None:
     if os.path.isfile(watchdog_path):
         _register_task_scheduler("MexalWatchdog", pyw_exe, f'"{watchdog_path}"', workdir)
 
+    # Task che avvia i container Docker Spedizioni al login (con delay 90s per attendere Docker Desktop)
+    spedizioni_ps1 = os.path.join(
+        "C:\\Users", getpass.getuser(),
+        "Desktop", "FABIO APPLICAZIONI", "SPEDIZIONI_APP",
+        "avvia_spedizioni_docker.ps1",
+    )
+    if os.path.isfile(spedizioni_ps1):
+        ps_exe = os.path.join(
+            os.environ.get("SystemRoot", "C:\\Windows"),
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+        )
+        ps_args = f'-NonInteractive -ExecutionPolicy Bypass -File "{spedizioni_ps1}"'
+        _register_task_scheduler_with_delay("SpedizioniDockerStartup", ps_exe, ps_args, os.path.dirname(spedizioni_ps1), delay_seconds=90)
+
     # Collegamento Desktop (per avvio manuale)
     desktop_dir = os.path.join(os.path.expanduser("~"), "Desktop")
     os.makedirs(desktop_dir, exist_ok=True)
@@ -444,7 +796,7 @@ def install_windows_shortcuts() -> None:
 
 
 def uninstall_windows_shortcuts() -> None:
-    for task in ("MexalDaemon", "MexalWatchdog"):
+    for task in ("MexalDaemon", "MexalWatchdog", "SpedizioniDockerStartup"):
         try:
             subprocess.run(
                 ["schtasks", "/Delete", "/TN", task, "/F"],
@@ -475,27 +827,31 @@ def _ensure_single_instance(mutex_name: str) -> None:
 
 
 USER = getpass.getuser()
-_BASE_PATH_DEFAULT = os.path.join("C:/Users", USER, "Desktop", "AMMINISTRAZIONE_2025")
-BOLLE_DIR            = os.environ.get("BOLLE_DIR")            or os.path.join(_BASE_PATH_DEFAULT, "BOLLE_2025")
-FATTURE_DIR          = os.environ.get("FATTURE_DIR")          or os.path.join(_BASE_PATH_DEFAULT, "FATTURE_2025")
-PREVENTIVI_DIR       = os.environ.get("PREVENTIVI_DIR")       or os.path.join(_BASE_PATH_DEFAULT, "PREVENTIVI_2025")
-ORDINI_DIR           = os.environ.get("ORDINI_DIR")           or os.path.join(_BASE_PATH_DEFAULT, "ORDINI_2025")
-ORDINI_FORNITORI_DIR = os.environ.get("ORDINI_FORNITORI_DIR") or os.path.join(_BASE_PATH_DEFAULT, "ORDINI FORNITORI_2025")
+_YEAR = datetime.now().year
+_BASE_PATH_DEFAULT   = os.path.join("C:/Users", USER, "Desktop", f"AMMINISTRAZIONE_{_YEAR}")
+BOLLE_DIR            = os.environ.get("BOLLE_DIR")            or os.path.join("C:/Users", USER, "Desktop", str(_YEAR), f"BOLLE_{_YEAR}")
+FATTURE_DIR          = os.environ.get("FATTURE_DIR")          or os.path.join("C:/Users", USER, "Desktop", str(_YEAR), f"FATTURE_{_YEAR}")
+PREVENTIVI_DIR       = os.environ.get("PREVENTIVI_DIR")       or os.path.join("C:/Users", USER, "Desktop", str(_YEAR), f"PREVENTIVI_{_YEAR}")
+ORDINI_DIR           = os.environ.get("ORDINI_DIR")           or os.path.join("C:/Users", USER, "Desktop", str(_YEAR), f"ORDINI_{_YEAR}")
+ORDINI_FORNITORI_DIR = os.environ.get("ORDINI_FORNITORI_DIR") or os.path.join("C:/Users", USER, "Desktop", str(_YEAR), f"ORDINI_FORNITORI_{_YEAR}")
+DIRETTE_DIR          = os.environ.get("DIRETTE_DIR")          or os.path.join("C:/Users", USER, "Desktop", f"DIRETTE_{_YEAR}")
 
-PATHS = {
-    # descrizioni
-    "Bolla": BOLLE_DIR,
+# Cartelle GRENKE (consegne non-dirette) per codice documento
+_GRENKE_PATHS: dict[str, str] = {
     "DDT": BOLLE_DIR,
-    "Fattura": FATTURE_DIR,
-    "Preventivo": PREVENTIVI_DIR,
-    "Ordine cliente": ORDINI_DIR,
-    "Ordine fornitore": ORDINI_FORNITORI_DIR,
-    # codici
-    "DDT": BOLLE_DIR,
-    "FC": FATTURE_DIR,
-    "PC": PREVENTIVI_DIR,
-    "OC": ORDINI_DIR,
-    "OF": ORDINI_FORNITORI_DIR,
+    "FC":  FATTURE_DIR,
+    "PC":  PREVENTIVI_DIR,
+    "OC":  ORDINI_DIR,
+    "OF":  ORDINI_FORNITORI_DIR,
+}
+
+# Sottocartelle per tipo documento dentro DIRETTE\{cliente}\
+_DIRETTE_SUBDIR: dict[str, str] = {
+    "DDT": "DDT",
+    "FC":  "FATTURE",
+    "PC":  "PREVENTIVI",
+    "OC":  "ORDINI",
+    "OF":  "ORDINI_FORNITORI",
 }
 
 LOG_FILE = "mexal_daemon.log"
@@ -720,6 +1076,14 @@ def _doc_code_from_lines(lines: list[str]) -> tuple[str, str]:
     ):
         return "OF", "Ordine fornitore"
 
+    # BF — Bolla Reso Fornitore
+    if (
+        any("reso" in n and ("fornitore" in n or "bolla" in n) for n in first_norm)
+        or any("resofornitore" in c or "bollareso" in c for c in first_compact)
+        or "resofornitore" in first5_joined_compact
+    ):
+        return "BF", "Bolla reso fornitore"
+
     # Fattura: fallback (in teoria già coperta sopra dalle prime righe)
     if ("fattura" in header_compact or "fattura" in header_norm) and "ordine" not in header_norm:
         return "FC", "Fattura"
@@ -747,6 +1111,9 @@ def parse_mexal_pdf(pdf_path: str) -> Optional[ParsedDoc]:
 
     raw_lines = [ln.strip() for ln in text.splitlines()]
     lines = [re.sub(r"\s+", " ", ln) for ln in raw_lines if ln.strip()]
+    # raw_lines_nonempty: stessi indici di lines ma con spazi multipli interni preservati.
+    # Serve per il parsing a due colonne (split su \s{2,}) senza che la normalizzazione li collassi.
+    raw_lines_nonempty = [ln for ln in raw_lines if ln.strip()]
 
     doc_code, doc_type = _doc_code_from_lines(lines)
     doc_number = ""
@@ -800,7 +1167,10 @@ def parse_mexal_pdf(pdf_path: str) -> Optional[ParsedDoc]:
     recipient = ""
     dest_idx = None
     for i, ln in enumerate(lines):
-        if "destinatario" in ln.lower():
+        lnl = ln.lower()
+        # Mexal DDT: "Destinatario" / "Destinatario Destinazione"
+        # Mexal Fattura: "Spett." / "Spettabile" / "Intestatario"
+        if "destinatario" in lnl or lnl.startswith("spett") or "intestatario" in lnl:
             dest_idx = i
             break
 
@@ -855,9 +1225,64 @@ def parse_mexal_pdf(pdf_path: str) -> Optional[ParsedDoc]:
     # Normalizza numero: rimuove spazi interni (es. "3/ 61" → "3/61")
     doc_number = re.sub(r"\s+", "", doc_number)
 
+    # DDT GRENKE: il destinatario effettivo è nel box "Destinazione" (colonna destra).
+    # Mexal stampa le due colonne sulla stessa riga separate da 2+ spazi:
+    #   "GRENKE LOCAZIONE SRL  SILVY'S FLOWERS DI ISVORANU SILVIA"
+    #    ^--- colonna sinistra       ^--- colonna destra (cliente reale)
+    # Rielaboriamo le stesse righe prendendo cols[-1] invece di cols[0].
+    _is_grenke = "grenke" in recipient.lower()
+    if _is_grenke and dest_idx is not None:
+        _new_rec = _new_ind = _new_cap = _new_cit = _new_prv = ""
+        _rec_found = False
+        for _ln in raw_lines_nonempty[dest_idx + 1 : dest_idx + 14]:
+            _stripped = _ln.strip()
+            if not _stripped:
+                continue
+            _cols = [p.strip() for p in re.split(r"\t+|\s{2,}", _stripped) if p.strip()]
+            if not _rec_found:
+                if len(_cols) >= 2:
+                    # Separazione riuscita con doppi spazi: prendi colonna destra
+                    _new_rec = _cols[-1]
+                else:
+                    # Mexal usa spazio singolo tra le due colonne nome: strip del prefisso GRENKE
+                    # es. "GRENKE LOCAZIONE SRL SILVY'S FLOWERS..." → "SILVY'S FLOWERS..."
+                    _stripped_grenke = re.sub(
+                        r"^GRENKE\s+\S+\s+\S+\s+", "", _stripped, flags=re.IGNORECASE
+                    ).strip()
+                    _new_rec = _stripped_grenke if _stripped_grenke else (_cols[0] if _cols else "")
+                _rec_found = True
+                continue
+            # Righe successive: indirizzo o CAP/città
+            if len(_cols) >= 2:
+                _right = _cols[-1]
+            else:
+                # Fallback indirizzo: Mexal stampa "Via X, NNN Via Y, NNN" su una riga.
+                # Splittiamo dopo il primo numero stradale seguito da spazio+MAIUSCOLO.
+                # es. "Via Gaetano de Castillia, 23 P.ZZA MERCATO..." → "P.ZZA MERCATO..."
+                _m_split = re.search(r"(?<=\d) (?=[A-Z])", _stripped)
+                _right = _stripped[_m_split.end():].strip() if _m_split else _stripped
+            if not _right:
+                continue
+            _m_addr = _ADDR_RE.search(_right)
+            if _m_addr:
+                _new_cap = _m_addr.group("cap")
+                _new_cit = _m_addr.group("citta").strip()
+                _new_prv = _m_addr.group("prov").upper()
+                break
+            if not _new_ind:
+                _new_ind = _right
+        if _new_rec:
+            _log(f"Grenke: destinazione='{_new_rec}' (era '{recipient}')")
+            recipient      = _new_rec
+            dest_indirizzo = _new_ind or dest_indirizzo
+            dest_cap       = _new_cap or dest_cap
+            dest_citta     = _new_cit or dest_citta
+            dest_provincia = _new_prv or dest_provincia
+
     # Estrai telefono e email — cerca solo dopo la sezione destinatario per evitare
     # di catturare i contatti di Fior d'Acqua dall'intestazione.
-    # Salta DDT Grenke (il numero presente sarebbe quello di Grenke, non del cliente).
+    # Dopo l'override GRENKE, recipient è il nome del cliente reale → is_grenke = False
+    # e il tel trovato ("Tel.NNN...") appartiene al cliente, non a GRENKE.
     dest_tel = dest_email = ""
     is_grenke = "grenke" in recipient.lower()
     tel_search_lines = lines[dest_idx:] if dest_idx is not None else lines
@@ -875,13 +1300,15 @@ def parse_mexal_pdf(pdf_path: str) -> Optional[ParsedDoc]:
     # Estrai PIVA del destinatario: cerca prima nella sezione destinatario,
     # poi su tutto il testo. La PIVA del mittente (FDA) compare nell'intestazione
     # nelle primissime righe, quindi la saltiamo cercando dall'indice dest_idx.
+    # Per DDT GRENKE la PIVA sul documento è quella di GRENKE, non del cliente → skip.
     piva = ""
-    search_lines = lines[dest_idx:] if dest_idx is not None else lines
-    for ln in search_lines:
-        m_piva = _PIVA_RE.search(ln)
-        if m_piva and m_piva.group("piva") not in _FDA_PIVE:
-            piva = m_piva.group("piva")
-            break
+    if not _is_grenke:
+        search_lines = lines[dest_idx:] if dest_idx is not None else lines
+        for ln in search_lines:
+            m_piva = _PIVA_RE.search(ln)
+            if m_piva and m_piva.group("piva") not in _FDA_PIVE:
+                piva = m_piva.group("piva")
+                break
 
     # Estrai matricola — cerca "Matricola:" o "N/S:" in tutto il testo
     matricola = ""
@@ -968,39 +1395,66 @@ def _gdrive_upload_to_inbox_pd(local_path: str, filename: str) -> str:
     return f.get("id", "")
 
 
+def _get_default_printer_name() -> str:
+    """Legge la stampante predefinita dal registro di Windows."""
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows NT\CurrentVersion\Windows",
+        )
+        device, _ = winreg.QueryValueEx(key, "Device")
+        winreg.CloseKey(key)
+        return device.split(",")[0].strip()
+    except Exception:
+        return ""
+
+
 def print_pdf(path: str, copies: int = 1) -> None:
     copies = max(1, int(copies or 1))
 
-    # Prefer SumatraPDF if installed: supports silent printing and copies.
+    # 1. SumatraPDF — stampa silenziosa nativa con supporto copie.
     sumatra_candidates = [
         r"C:\Program Files\SumatraPDF\SumatraPDF.exe",
         r"C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe",
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "SumatraPDF", "SumatraPDF.exe"),
     ]
     sumatra = next((p for p in sumatra_candidates if os.path.isfile(p)), None)
     if sumatra:
-        # -print-settings supports copies; use default printer.
-        args = [
-            sumatra,
-            "-silent",
-            "-print-to-default",
-            "-print-settings",
-            f"{copies}x",
-            path,
-        ]
-        subprocess.run(args, check=True)
+        subprocess.run(
+            [sumatra, "-silent", "-print-to-default", "-print-settings", f"{copies}x", path],
+            check=True,
+        )
         return
 
-    # Fallback: uses the default PDF handler. Copies may be ignored by some viewers.
+    # 2. Adobe Acrobat DC / Reader — flag /t per stampa silenziosa sulla stampante predefinita.
+    acrobat_candidates = [
+        r"C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe",
+        r"C:\Program Files (x86)\Adobe\Acrobat DC\Acrobat\Acrobat.exe",
+        r"C:\Program Files\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
+        r"C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
+    ]
+    acrobat = next((p for p in acrobat_candidates if os.path.isfile(p)), None)
+    if acrobat:
+        printer = _get_default_printer_name()
+        for _ in range(copies):
+            args = [acrobat, "/t", path]
+            if printer:
+                args.append(printer)
+            subprocess.Popen(args, creationflags=0x08000000)
+            time.sleep(3.0)  # Acrobat deve inviare il job prima della copia successiva
+        return
+
+    # 3. Fallback shell — funziona solo se l'app predefinita registra il verbo "print".
     for _ in range(copies):
         try:
             os.startfile(path, "print")
         except OSError as e:
-            # WinError 1155: no application associated with the specified file for this operation
             if getattr(e, "winerror", None) == 1155:
                 raise RuntimeError(
-                    "Nessuna applicazione associata alla stampa PDF (WinError 1155). "
-                    "Installa un lettore PDF che supporti la stampa da shell (consigliato: SumatraPDF) "
-                    "oppure imposta un'app predefinita per i PDF con la funzione di stampa."
+                    "Nessuna applicazione associata alla stampa PDF (WinError 1155).\n"
+                    "Adobe Acrobat DC è installato ma non risponde al comando stampa.\n"
+                    "Soluzione consigliata: installa SumatraPDF (gratuito, ~10 MB) da https://www.sumatrapdfreader.org/"
                 )
             raise
         time.sleep(1.0)
@@ -1023,6 +1477,10 @@ class MexalDaemonApp:
         self._last_detected: list[ParsedDoc] = []
         self._current_doc: Optional[ParsedDoc] = None
         self._tick_count = 0
+
+        # Destinatari non sincronizzati (server Spedizioni non disponibile al momento del DDT)
+        self._pending_upserts: list[ParsedDoc] = []
+        self._upsert_lock = threading.Lock()
 
         self.root.after(1000, self._tick)
 
@@ -1056,11 +1514,17 @@ class MexalDaemonApp:
             self._tick_count += 1
             if self._tick_count == 1:
                 _log("Tick loop started")
+
+            # Retry upsert destinatari ogni 30 secondi
+            if self._tick_count % 30 == 0:
+                self._retry_pending_upserts()
+
             new_docs = self._scan_for_new_docs()
             if new_docs:
                 self._last_detected = new_docs
                 self._current_doc = new_docs[0]
                 first_dest: Optional[str] = None
+                first_gdrive_queued = False
                 for doc in new_docs:
                     doc_id = self._doc_id(doc)
                     dest = self._do_save(doc, doc_id)
@@ -1075,21 +1539,27 @@ class MexalDaemonApp:
                                 args=(doc, doc_id, dest),
                                 daemon=True,
                             ).start()
-                        if is_esp and _GDRIVE_AVAILABLE and GDRIVE_INBOX_PD_FOLDER_ID \
-                                and os.environ.get("GOOGLE_CLIENT_ID") \
-                                and os.environ.get("GOOGLE_REFRESH_TOKEN"):
+                        gdrive_ok = (
+                            is_esp and _GDRIVE_AVAILABLE
+                            and bool(GDRIVE_INBOX_PD_FOLDER_ID)
+                            and bool(os.environ.get("GOOGLE_CLIENT_ID"))
+                            and bool(os.environ.get("GOOGLE_REFRESH_TOKEN"))
+                        )
+                        if gdrive_ok:
                             threading.Thread(
                                 target=self._do_gdrive_upload_bg,
                                 args=(doc, doc_id),
                                 daemon=True,
                             ).start()
+                            if doc is new_docs[0]:
+                                first_gdrive_queued = True
                         if doc.doc_code == "DDT":
                             threading.Thread(
                                 target=self._upsert_destinatario_bg,
                                 args=(doc,),
                                 daemon=True,
                             ).start()
-                self._show_overlay(new_docs[0], first_dest)
+                self._show_overlay(new_docs[0], first_dest, gdrive_queued=first_gdrive_queued)
         except Exception as e:
             _log(f"Tick error (#{self._tick_count}): {e}")
         finally:
@@ -1098,22 +1568,36 @@ class MexalDaemonApp:
             except Exception as e:
                 _log(f"After error: {e}")
 
+    def _iter_mexal_pdfs(self) -> list[tuple[str, float]]:
+        """Elenca tutti i PDF nelle cartelle stpvideo* dentro MEXAL_TEMP."""
+        pdfs: list[tuple[str, float]] = []
+        if not os.path.isdir(MEXAL_TEMP):
+            return pdfs
+        try:
+            for entry in os.scandir(MEXAL_TEMP):
+                if not entry.is_dir():
+                    continue
+                if not entry.name.lower().startswith("stpvideo"):
+                    continue
+                try:
+                    for fentry in os.scandir(entry.path):
+                        if fentry.name.lower().endswith(".pdf") and fentry.is_file():
+                            mtime = _safe_get_mtime(fentry.path)
+                            if mtime is not None:
+                                pdfs.append((fentry.path, mtime))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return pdfs
+
     def _scan_for_new_docs(self) -> list[ParsedDoc]:
         if not os.path.isdir(MEXAL_TEMP):
             if self._tick_count == 1 or self._tick_count % 10 == 0:
                 _log(f"Scan: MEXAL_TEMP non esiste: {MEXAL_TEMP}")
             return []
 
-        pdfs = []
-        for root_dir, _, files in os.walk(MEXAL_TEMP):
-            for fn in files:
-                if fn.lower().endswith(".pdf"):
-                    full_path = os.path.join(root_dir, fn)
-                    mtime = _safe_get_mtime(full_path)
-                    if mtime is None:
-                        continue
-                    pdfs.append((full_path, mtime))
-
+        pdfs = self._iter_mexal_pdfs()
         pdfs.sort(key=lambda x: x[1], reverse=True)
 
         if self._tick_count == 1 or self._tick_count % 10 == 0:
@@ -1126,6 +1610,9 @@ class MexalDaemonApp:
             if last_mtime is not None and mtime <= float(last_mtime):
                 continue
 
+            # File nuovo o modificato — logga subito a ogni tick (non solo ogni 10)
+            _log(f"Scan: nuovo/modificato: {os.path.basename(path)} folder={os.path.basename(os.path.dirname(path))} mtime={mtime:.1f}")
+
             size = _safe_get_size(path)
             if size is None:
                 continue
@@ -1136,8 +1623,7 @@ class MexalDaemonApp:
                 del hist[0]
 
             if len(hist) < 2 or hist[-1] != hist[-2]:
-                if self._tick_count % 10 == 0:
-                    _log(f"Scan: not_stable_yet: {os.path.basename(path)} size_hist={hist}")
+                _log(f"Scan: not_stable_yet: {os.path.basename(path)} size_hist={hist}")
                 continue
 
             doc = parse_mexal_pdf(path)
@@ -1154,7 +1640,7 @@ class MexalDaemonApp:
 
         return parsed
 
-    def _show_overlay(self, doc: ParsedDoc, dest_path: Optional[str] = None) -> None:
+    def _show_overlay(self, doc: ParsedDoc, dest_path: Optional[str] = None, gdrive_queued: bool = False) -> None:
         if self.overlay and self.overlay.winfo_exists():
             self.overlay.lift()
             return
@@ -1215,11 +1701,18 @@ class MexalDaemonApp:
                 font=("Segoe UI", 9),
                 bootstyle="success",
             ).grid(row=3, column=0, columnspan=2, sticky="w")
+            if gdrive_queued:
+                ttk.Label(
+                    body,
+                    text="⬆️  Caricamento GDrive Inbox_PD in corso…",
+                    font=("Segoe UI", 9),
+                    bootstyle="primary",
+                ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
             ttk.Label(
                 body,
                 text="Vuoi stamparlo o inviarlo per email?",
                 font=("Segoe UI", 10),
-            ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
         else:
             ttk.Label(
                 body,
@@ -1323,7 +1816,6 @@ class MexalDaemonApp:
         btn_copie.grid(row=4, column=0, sticky="w")
 
         def do_stampa(n: int) -> None:
-            dlg.destroy()
             try:
                 print_pdf(dest_path, copies=n)
                 st = self._get_doc_state(doc_id)
@@ -1333,45 +1825,7 @@ class MexalDaemonApp:
                 messagebox.showerror("Errore stampa", str(exc))
 
         def do_email() -> None:
-            fields = self._ask_email(doc)
-            if not fields:
-                return
-            to_addr = fields.get("to", "").strip()
-            subject = fields.get("subject", "").strip()
-            body_text = fields.get("body", "").strip()
-            to_addrs = [a.strip() for a in re.split(r"[;,\s]+", to_addr) if a.strip()]
-            if not to_addrs:
-                messagebox.showwarning("Attenzione", "Inserisci un destinatario valido.")
-                return
-            cfg = _smtp_config()
-            host = str(cfg.get("host") or "").strip()
-            port = int(cfg.get("port") or 0)
-            user = str(cfg.get("user") or "").strip()
-            password = str(cfg.get("password") or "").strip()
-            from_addr = str(cfg.get("from_addr") or "").strip()
-            if not host or not port or not user or not password:
-                ok = self._smtp_settings_wizard()
-                if not ok:
-                    return
-                cfg = _smtp_config()
-                host = str(cfg.get("host") or "").strip()
-                port = int(cfg.get("port") or 0)
-                user = str(cfg.get("user") or "").strip()
-                password = str(cfg.get("password") or "").strip()
-                from_addr = str(cfg.get("from_addr") or "").strip()
-            try:
-                send_email_smtp(
-                    host=host, port=port, user=user, password=password,
-                    from_addr=from_addr, to_addrs=to_addrs,
-                    subject=subject, body=body_text,
-                    attachment_path=os.path.abspath(dest_path),
-                )
-                st = self._get_doc_state(doc_id)
-                st["emailed"] = True
-                _save_json(STATE_FILE, self.state)
-                messagebox.showinfo("Email", "Email inviata.")
-            except Exception as exc:
-                messagebox.showerror("Errore email", str(exc))
+            self._send_email_for_doc(doc, doc_id, dest_path)
 
         for i, label in enumerate(["1 copia", "2 copie", "3 copie", "4 copie"]):
             n = i + 1
@@ -1402,48 +1856,11 @@ class MexalDaemonApp:
             width=16,
         ).grid(row=0, column=1, sticky="ew")
 
-        # Pulsante Procedura CE — solo per Fatture
-        if doc.doc_code == "FC":
+        # Pulsante Procedura CE — solo per Fatture con matricola rilevata
+        if doc.doc_code == "FC" and doc.matricola:
             def do_procedura_ce() -> None:
-                bat = GENERA_DOCUMENTI_BAT
-                if not os.path.isfile(bat):
-                    messagebox.showerror(
-                        "Procedura CE",
-                        f"File non trovato:\n{bat}\n\n"
-                        "Verifica il percorso in GENERA_DOCUMENTI_BAT nel local.env",
-                    )
-                    return
-                try:
-                    prefill = {k: v for k, v in {
-                        "nomeAzienda": doc.recipient,
-                        "indirizzo":   doc.dest_indirizzo,
-                        "cap":         doc.dest_cap,
-                        "citta":       doc.dest_citta,
-                        "piva":        doc.piva,
-                        "email":       doc.dest_email,
-                        "matricola":   doc.matricola,
-                        "modello":     doc.modello,
-                    }.items() if v}
-                    prefill_path = os.path.join(os.path.dirname(bat), "prefill.json")
-                    try:
-                        with open(prefill_path, "w", encoding="utf-8") as _pf:
-                            json.dump(prefill, _pf, ensure_ascii=False, indent=2)
-                    except Exception as exc:
-                        _log(f"Prefill write error: {exc}")
-
-                    subprocess.Popen(
-                        [bat],
-                        cwd=os.path.dirname(bat),
-                        creationflags=0x00000001,  # CREATE_BREAKAWAY_FROM_JOB — finestra separata
-                        shell=True,
-                    )
-                    st = self._get_doc_state(doc_id)
-                    st["procedura_ce_avviata"] = True
-                    _save_json(STATE_FILE, self.state)
-                    _log(f"Procedura CE avviata: {bat}")
-                    dlg.destroy()
-                except Exception as exc:
-                    messagebox.showerror("Errore", f"Impossibile avviare la Procedura CE:\n{exc}")
+                dlg.destroy()
+                self._lancia_genera_documenti(doc, doc_id)
 
             ce_frame = ttk.Frame(dlg, padding=(20, 0, 20, 14))
             ce_frame.grid(row=3, column=0, sticky="ew")
@@ -1466,17 +1883,20 @@ class MexalDaemonApp:
         base = os.path.basename(doc.source_path)
         return f"{base}|{int(doc.created_at)}"
 
+    def _dirette_client_folder(self, doc: ParsedDoc) -> str:
+        """Restituisce il percorso DIRETTE_{year}\{cliente}\{tipo} per vendite dirette."""
+        client_name = re.sub(r'[\\/:*?"<>|]', "-", doc.recipient).strip() or "SCONOSCIUTO"
+        subdir = _DIRETTE_SUBDIR.get(doc.doc_code, "ALTRI")
+        return os.path.join(DIRETTE_DIR, client_name, subdir)
+
     def _preferred_save_dir(self, doc: ParsedDoc) -> str:
-        if doc.doc_code in PATHS:
-            chosen = PATHS[doc.doc_code]
-            _log(f"SaveDir: doc_code={doc.doc_code} doc_type={doc.doc_type} chosen={chosen}")
+        is_grenke = "grenke" in doc.recipient.lower()
+        if not is_grenke:
+            chosen = self._dirette_client_folder(doc)
+            _log(f"SaveDir DIRETTE: recipient={doc.recipient[:40]} code={doc.doc_code} → {chosen}")
             return chosen
-        if doc.doc_type in PATHS:
-            chosen = PATHS[doc.doc_type]
-            _log(f"SaveDir: doc_code={doc.doc_code} doc_type={doc.doc_type} chosen={chosen}")
-            return chosen
-        chosen = os.path.join(BASE_PATH, "DOCUMENTI_2025")
-        _log(f"SaveDir: doc_code={doc.doc_code} doc_type={doc.doc_type} chosen={chosen}")
+        chosen = _GRENKE_PATHS.get(doc.doc_code) or os.path.join(_BASE_PATH_DEFAULT, "DOCUMENTI")
+        _log(f"SaveDir GRENKE: doc_code={doc.doc_code} → {chosen}")
         return chosen
 
     def _get_doc_state(self, doc_id: str) -> dict:
@@ -1488,12 +1908,14 @@ class MexalDaemonApp:
                 "emailed": False,
                 "gdrive_uploaded": False,
                 "crm_synced": False,
+                "crm_doc_uuid": "",
                 "dest_path": "",
                 "meta": {},
             },
         )
         st.setdefault("gdrive_uploaded", False)
         st.setdefault("crm_synced", False)
+        st.setdefault("crm_doc_uuid", "")
         return st
 
     def _show_list_window(self):
@@ -1675,18 +2097,9 @@ class MexalDaemonApp:
         win.protocol("WM_DELETE_WINDOW", win.withdraw)
 
     def _collect_last_docs(self, limit: int = 5) -> list[ParsedDoc]:
-        pdfs = []
         if not os.path.isdir(MEXAL_TEMP):
             return []
-
-        for root_dir, _, files in os.walk(MEXAL_TEMP):
-            for fn in files:
-                if fn.lower().endswith(".pdf"):
-                    full_path = os.path.join(root_dir, fn)
-                    mtime = _safe_get_mtime(full_path)
-                    if mtime is None:
-                        continue
-                    pdfs.append((full_path, mtime))
+        pdfs = self._iter_mexal_pdfs()
 
         pdfs.sort(key=lambda x: x[1], reverse=True)
 
@@ -1764,23 +2177,57 @@ class MexalDaemonApp:
         _save_json(STATE_FILE, self.state)
         return dest_path
 
+    def _send_email_for_doc(self, doc: "ParsedDoc", doc_id: str, dest: str) -> None:
+        """Chiede dati email, verifica SMTP e invia il documento allegato."""
+        fields = self._ask_email(doc)
+        if not fields:
+            return
+        to_addr = fields.get("to", "").strip()
+        subject = fields.get("subject", "").strip()
+        body_text = fields.get("body", "").strip()
+        to_addrs = [a.strip() for a in re.split(r"[;,\s]+", to_addr) if a.strip()]
+        if not to_addrs:
+            messagebox.showwarning("Attenzione", "Inserisci un destinatario valido.")
+            return
+        cfg = _smtp_config()
+        host = str(cfg.get("host") or "").strip()
+        port = int(cfg.get("port") or 0)
+        user = str(cfg.get("user") or "").strip()
+        password = str(cfg.get("password") or "").strip()
+        from_addr = str(cfg.get("from_addr") or "").strip()
+        if not host or not port or not user or not password:
+            if not self._smtp_settings_wizard():
+                return
+            cfg = _smtp_config()
+            host = str(cfg.get("host") or "").strip()
+            port = int(cfg.get("port") or 0)
+            user = str(cfg.get("user") or "").strip()
+            password = str(cfg.get("password") or "").strip()
+            from_addr = str(cfg.get("from_addr") or "").strip()
+        try:
+            send_email_smtp(
+                host=host, port=port, user=user, password=password,
+                from_addr=from_addr, to_addrs=to_addrs,
+                subject=subject, body=body_text,
+                attachment_path=os.path.abspath(dest),
+            )
+            st = self._get_doc_state(doc_id)
+            st["emailed"] = True
+            _save_json(STATE_FILE, self.state)
+            messagebox.showinfo("Email", "Email inviata.")
+        except Exception as exc:
+            messagebox.showerror("Errore email", str(exc))
+
     def _dialog_ddt_azione(self, doc: "ParsedDoc", doc_id: str, is_espositore: bool, is_vettore: bool) -> None:
-        """Dopo il salvataggio di un DDT, gestisce i 3 casi:
-        - non-espositore → Spedizione default
-        - espositore + vettore → Procedura default
-        - espositore + non vettore → chiede stampa → Procedura
+        """Dialog DDT post-salvataggio.
+        Caso 3 (espositore + consegna diretta) → _dialog_espositore_diretto.
+        Casi 1+2 unificati: stampa/email accessibili prima di creare la spedizione.
+        Procedura Documentale non disponibile dai DDT — solo dalle Fatture.
         """
-        # Caso 3: espositore consegnato direttamente (non vettore) → stampa + procedura
         if is_espositore and not is_vettore:
             self._dialog_espositore_diretto(doc, doc_id)
             return
 
-        gdrive_ok = (
-            _GDRIVE_AVAILABLE
-            and bool(GDRIVE_INBOX_PD_FOLDER_ID)
-            and bool(os.environ.get("GOOGLE_CLIENT_ID"))
-            and bool(os.environ.get("GOOGLE_REFRESH_TOKEN"))
-        )
         spedizioni_url = os.environ.get("SPEDIZIONI_API_URL", "http://localhost:8000")
 
         dlg = tk.Toplevel(self.root)
@@ -1800,56 +2247,37 @@ class MexalDaemonApp:
         body = ttk.Frame(dlg, padding=(20, 14, 20, 6))
         body.grid(row=1, column=0, sticky="nsew")
 
-        # Caso 1: non-espositore → default Spedizione
-        # Caso 2: espositore + vettore → default Procedura
-        if is_espositore:
-            hint = "Rilevato espositore — consigliata Procedura Documentale"
-        else:
-            hint = "DDT standard — consigliata Nuova Spedizione"
-        ttk.Label(body, text=hint, font=("Segoe UI", 10)).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(body, text=doc.recipient, font=("Segoe UI", 11, "bold")).grid(
+            row=0, column=0, sticky="w"
+        )
+        if doc.doc_number:
+            ttk.Label(
+                body,
+                text=f"n° {doc.doc_number}  •  {doc.doc_date or ''}".strip(" •"),
+                font=("Segoe UI", 9),
+                bootstyle="secondary",
+            ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
         addr_parts = [p for p in [doc.dest_cap, doc.dest_citta, doc.dest_provincia] if p]
         if addr_parts:
-            addr_str = f"{doc.dest_cap} {doc.dest_citta} ({doc.dest_provincia})"
-            ttk.Label(body, text=addr_str, font=("Segoe UI", 9), bootstyle="secondary").grid(
-                row=1, column=0, sticky="w", pady=(0, 8)
-            )
+            ttk.Label(
+                body,
+                text=f"{doc.dest_cap} {doc.dest_citta} ({doc.dest_provincia})",
+                font=("Segoe UI", 9),
+                bootstyle="secondary",
+            ).grid(row=2, column=0, sticky="w", pady=(2, 0))
 
-        btn_row = ttk.Frame(dlg, padding=(20, 8, 20, 4))
-        btn_row.grid(row=2, column=0, sticky="ew")
-        btn_row.columnconfigure(0, weight=1)
-        btn_row.columnconfigure(1, weight=1)
+        if is_espositore:
+            ttk.Label(
+                body,
+                text="🏪  Espositore rilevato",
+                font=("Segoe UI", 9, "bold"),
+                bootstyle="warning",
+            ).grid(row=3, column=0, sticky="w", pady=(6, 0))
 
-        def do_procedura():
-            dlg.destroy()
-            self._do_save(doc, doc_id)
-            if not gdrive_ok:
-                messagebox.showerror("GDrive", "Credenziali Google non configurate.")
-                return
-            self._do_gdrive_upload(doc, doc_id)
+        ttk.Separator(body).grid(row=4, column=0, sticky="ew", pady=(12, 8))
 
-        def do_spedizione():
-            dlg.destroy()
-            self._do_save(doc, doc_id)
-            self._do_spedizione(doc, doc_id, spedizioni_url)
-
-        proc_style = "primary" if is_espositore else "primary-outline"
-        sped_style = "success-outline" if is_espositore else "success"
-
-        ttk.Button(
-            btn_row, text="☁️  Procedura Documentale",
-            bootstyle=proc_style, command=do_procedura, width=22,
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        ttk.Button(
-            btn_row, text="📦  Nuova Spedizione",
-            bootstyle=sped_style, command=do_spedizione, width=22,
-        ).grid(row=0, column=1, sticky="ew")
-
-        btn_row2 = ttk.Frame(dlg, padding=(20, 0, 20, 12))
-        btn_row2.grid(row=3, column=0, sticky="ew")
-        btn_row2.columnconfigure(0, weight=1)
-        btn_row2.columnconfigure(1, weight=1)
-
+        # Stampa / Email — non chiudono il dialog, permettono di agire prima della spedizione
         def do_stampa():
             copies = self._ask_copies()
             if copies is None:
@@ -1872,62 +2300,40 @@ class MexalDaemonApp:
             if not dest:
                 messagebox.showerror("Errore", "Documento non ancora salvato.")
                 return
-            fields = self._ask_email(doc)
-            if not fields:
-                return
-            to_addr = fields.get("to", "").strip()
-            subject = fields.get("subject", "").strip()
-            body_text = fields.get("body", "").strip()
-            to_addrs = [a.strip() for a in re.split(r"[;,\s]+", to_addr) if a.strip()]
-            if not to_addrs:
-                messagebox.showwarning("Attenzione", "Inserisci un destinatario valido.")
-                return
-            cfg = _smtp_config()
-            host = str(cfg.get("host") or "").strip()
-            port = int(cfg.get("port") or 0)
-            user = str(cfg.get("user") or "").strip()
-            password = str(cfg.get("password") or "").strip()
-            from_addr = str(cfg.get("from_addr") or "").strip()
-            if not host or not port or not user or not password:
-                ok = self._smtp_settings_wizard()
-                if not ok:
-                    return
-                cfg = _smtp_config()
-                host = str(cfg.get("host") or "").strip()
-                port = int(cfg.get("port") or 0)
-                user = str(cfg.get("user") or "").strip()
-                password = str(cfg.get("password") or "").strip()
-                from_addr = str(cfg.get("from_addr") or "").strip()
-            try:
-                send_email_smtp(
-                    host=host, port=port, user=user, password=password,
-                    from_addr=from_addr, to_addrs=to_addrs,
-                    subject=subject, body=body_text,
-                    attachment_path=os.path.abspath(dest),
-                )
-                st_doc["emailed"] = True
-                _save_json(STATE_FILE, self.state)
-                messagebox.showinfo("Email", "Email inviata.")
-            except Exception as exc:
-                messagebox.showerror("Errore email", str(exc))
+            self._send_email_for_doc(doc, doc_id, dest)
 
+        se_row = ttk.Frame(body)
+        se_row.grid(row=5, column=0, sticky="ew", pady=(0, 4))
+        se_row.columnconfigure(0, weight=1)
+        se_row.columnconfigure(1, weight=1)
         ttk.Button(
-            btn_row2, text="🖨️  Stampa",
-            bootstyle="warning-outline", command=do_stampa, width=22,
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+            se_row, text="🖨️  Stampa",
+            bootstyle="secondary-outline", command=do_stampa, width=18,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
         ttk.Button(
-            btn_row2, text="📧  Invia Email",
-            bootstyle="info-outline", command=do_email, width=22,
+            se_row, text="📧  Invia Email",
+            bootstyle="info-outline", command=do_email, width=18,
         ).grid(row=0, column=1, sticky="ew")
+
+        # Nuova Spedizione — azione principale, chiude il dialog
+        sped_frame = ttk.Frame(dlg, padding=(20, 8, 20, 4))
+        sped_frame.grid(row=2, column=0, sticky="ew")
+        sped_frame.columnconfigure(0, weight=1)
+        ttk.Button(
+            sped_frame,
+            text="📦  Nuova Spedizione",
+            bootstyle="success",
+            command=lambda: (dlg.destroy(), self._do_spedizione(doc, doc_id, spedizioni_url)),
+        ).grid(row=0, column=0, sticky="ew")
 
         ttk.Button(
             dlg, text="Chiudi",
             bootstyle="secondary-link",
             command=dlg.destroy,
-        ).grid(row=4, column=0, pady=(0, 8))
+        ).grid(row=3, column=0, pady=(0, 8))
 
         dlg.update_idletasks()
-        w = max(dlg.winfo_reqwidth(), 420)
+        w = max(dlg.winfo_reqwidth(), 400)
         h = dlg.winfo_reqheight()
         x = int((dlg.winfo_screenwidth() - w) / 2)
         y = int((dlg.winfo_screenheight() - h) / 2)
@@ -1982,17 +2388,11 @@ class MexalDaemonApp:
                     _save_json(STATE_FILE, self.state)
                 except Exception as e:
                     messagebox.showerror("Errore stampa", str(e))
-            if gdrive_ok:
-                self._do_gdrive_upload(doc, doc_id)
-            else:
-                messagebox.showerror("GDrive", "Credenziali Google non configurate.")
+            self._lancia_genera_documenti(doc, doc_id)
 
         def do_solo_procedura():
             dlg.destroy()
-            if gdrive_ok:
-                self._do_gdrive_upload(doc, doc_id)
-            else:
-                messagebox.showerror("GDrive", "Credenziali Google non configurate.")
+            self._lancia_genera_documenti(doc, doc_id)
 
         ttk.Button(
             btn_row, text="🖨️  Stampa + Procedura",
@@ -2015,6 +2415,45 @@ class MexalDaemonApp:
         x = int((dlg.winfo_screenwidth() - w) / 2)
         y = int((dlg.winfo_screenheight() - h) / 2)
         dlg.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _lancia_genera_documenti(self, doc: "ParsedDoc", doc_id: str) -> None:
+        """Lancia AVVIA GeneraDocumenti.bat con prefill dati dal documento."""
+        bat = GENERA_DOCUMENTI_BAT
+        if not os.path.isfile(bat):
+            messagebox.showerror(
+                "Procedura CE",
+                f"File non trovato:\n{bat}\n\n"
+                "Verifica il percorso in GENERA_DOCUMENTI_BAT nel local.env",
+            )
+            return
+        prefill = {k: v for k, v in {
+            "nomeAzienda": doc.recipient,
+            "indirizzo":   doc.dest_indirizzo,
+            "cap":         doc.dest_cap,
+            "citta":       doc.dest_citta,
+            "piva":        doc.piva,
+            "email":       doc.dest_email,
+            "matricola":   doc.matricola,
+            "modello":     doc.modello,
+        }.items() if v}
+        prefill_path = os.path.join(os.path.dirname(bat), "prefill.json")
+        try:
+            with open(prefill_path, "w", encoding="utf-8") as _pf:
+                json.dump(prefill, _pf, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            _log(f"Prefill write error: {exc}")
+        try:
+            subprocess.Popen(
+                ["cmd", "/c", bat],
+                cwd=os.path.dirname(bat),
+                creationflags=0x08000000,
+            )
+            st = self._get_doc_state(doc_id)
+            st["procedura_ce_avviata"] = True
+            _save_json(STATE_FILE, self.state)
+            _log(f"Procedura CE avviata: {bat}")
+        except Exception as exc:
+            messagebox.showerror("Errore", f"Impossibile avviare la Procedura CE:\n{exc}")
 
     def _do_gdrive_upload(self, doc: "ParsedDoc", doc_id: str) -> None:
         numero = (doc.doc_number or "").strip()
@@ -2055,6 +2494,18 @@ class MexalDaemonApp:
             _log(f"GDrive auto-upload OK: {filename} → id={file_id}")
             st["gdrive_uploaded"] = True
             _save_json(STATE_FILE, self.state)
+            # Aggiorna percorso_pdf_gdrive nel documento CRM
+            doc_uuid = st.get("crm_doc_uuid", "")
+            if doc_uuid and file_id and SUPABASE_URL and SUPABASE_KEY:
+                try:
+                    _supabase_patch(
+                        "documenti",
+                        f"id=eq.{urllib.parse.quote(doc_uuid)}",
+                        {"percorso_pdf_gdrive": file_id},
+                    )
+                    _log(f"CRM: percorso_pdf_gdrive aggiornato doc={doc_uuid}")
+                except Exception as pe:
+                    _log(f"CRM: patch percorso_pdf_gdrive FAIL: {pe}")
             _tg_send_simple(
                 f"☁️ GDrive Inbox\\_PD ✅\n"
                 f"{doc.doc_type} {doc.doc_number} — {dest[:40]}"
@@ -2092,10 +2543,26 @@ class MexalDaemonApp:
             dest_id = result.get("destinatario_id", "?")
             _log(f"Spedizioni UPSERT: {action} id={dest_id} nome={doc.recipient[:40]}")
         except Exception as e:
-            _log(f"Spedizioni UPSERT FAIL: {e}")
+            if _is_connection_refused(e):
+                _log(f"Spedizioni UPSERT: server non disponibile, retry programmato ({doc.recipient[:40]})")
+                with self._upsert_lock:
+                    if not any(d.recipient == doc.recipient for d in self._pending_upserts):
+                        self._pending_upserts.append(doc)
+            else:
+                _log(f"Spedizioni UPSERT FAIL: {e}")
+
+    def _retry_pending_upserts(self) -> None:
+        with self._upsert_lock:
+            pending = list(self._pending_upserts)
+            self._pending_upserts.clear()
+        if not pending:
+            return
+        _log(f"Retry UPSERT: {len(pending)} destinatari in coda")
+        for doc in pending:
+            threading.Thread(target=self._upsert_destinatario_bg, args=(doc,), daemon=True).start()
 
     def _crm_upsert_bg(self, doc: "ParsedDoc", doc_id: str, dest_path: str) -> None:
-        """Upsert anagrafica + insert documento su Supabase CRM — background thread."""
+        """Upsert anagrafica + insert documento + righe + espositori su Supabase CRM."""
         st = self._get_doc_state(doc_id)
         if st.get("crm_synced"):
             return
@@ -2111,37 +2578,48 @@ class MexalDaemonApp:
             _log(f"CRM: data non parsabile '{doc.doc_date}', uso oggi")
 
         try:
-            # Upsert anagrafica cliente
+            # 1. Lookup regione/provincia estesa da cap_comuni
+            regione = ""
+            provincia_estesa = ""
+            if doc.dest_cap:
+                regione, provincia_estesa = _lookup_regione(doc.dest_cap)
+
+            # 2. Upsert anagrafica cliente
             if doc.doc_code in _CLIENTE_CODES and doc.piva:
                 cliente: dict = {
                     "piva":            doc.piva,
                     "ragione_sociale": doc.recipient,
                 }
-                if doc.dest_cap:       cliente["cap"]             = doc.dest_cap
-                if doc.dest_citta:     cliente["comune"]          = doc.dest_citta
-                if doc.dest_provincia: cliente["sigla_provincia"] = doc.dest_provincia[:2].upper()
-                # email e telefono solo dai DDT (= BC/BC3 nel CRM)
+                if doc.dest_cap:        cliente["cap"]             = doc.dest_cap
+                if doc.dest_citta:      cliente["comune"]          = doc.dest_citta
+                if doc.dest_provincia:  cliente["sigla_provincia"] = doc.dest_provincia[:2].upper()
+                if doc.dest_indirizzo:  cliente["indirizzo"]       = doc.dest_indirizzo
+                if provincia_estesa:    cliente["provincia"]       = provincia_estesa
+                if regione:             cliente["regione"]         = regione
                 if doc.doc_code == "DDT":
-                    if doc.dest_email: cliente["email"]    = doc.dest_email
-                    if doc.dest_tel:   cliente["telefono"] = doc.dest_tel
+                    if doc.dest_email:  cliente["email"]    = doc.dest_email
+                    if doc.dest_tel:    cliente["telefono"] = doc.dest_tel
                 _supabase_post("clienti", cliente)
-                _log(f"CRM: clienti upsert OK piva={doc.piva} tipo={crm_tipo}")
+                _log(f"CRM: clienti upsert OK piva={doc.piva} regione={regione}")
 
-            # Upsert anagrafica fornitore
+            # 3. Upsert anagrafica fornitore
             elif doc.doc_code in _FORNITORE_CODES and doc.piva:
                 fornitore: dict = {
                     "piva":            doc.piva,
                     "ragione_sociale": doc.recipient,
                 }
-                if doc.dest_cap:       fornitore["cap"]             = doc.dest_cap
-                if doc.dest_citta:     fornitore["comune"]          = doc.dest_citta
-                if doc.dest_provincia: fornitore["sigla_provincia"] = doc.dest_provincia[:2].upper()
-                if doc.dest_email:     fornitore["email"]           = doc.dest_email
-                if doc.dest_tel:       fornitore["telefono"]        = doc.dest_tel
+                if doc.dest_cap:        fornitore["cap"]             = doc.dest_cap
+                if doc.dest_citta:      fornitore["comune"]          = doc.dest_citta
+                if doc.dest_provincia:  fornitore["sigla_provincia"] = doc.dest_provincia[:2].upper()
+                if doc.dest_indirizzo:  fornitore["indirizzo"]       = doc.dest_indirizzo
+                if provincia_estesa:    fornitore["provincia"]       = provincia_estesa
+                if regione:             fornitore["regione"]         = regione
+                if doc.dest_email:      fornitore["email"]           = doc.dest_email
+                if doc.dest_tel:        fornitore["telefono"]        = doc.dest_tel
                 _supabase_post("fornitori", fornitore)
-                _log(f"CRM: fornitori upsert OK piva={doc.piva} tipo={crm_tipo}")
+                _log(f"CRM: fornitori upsert OK piva={doc.piva}")
 
-            # Insert documento
+            # 4. Insert documento — recupera UUID per righe e GDrive patch
             documento: dict = {
                 "numero_documento":    doc.doc_number,
                 "tipo":                crm_tipo,
@@ -2153,8 +2631,45 @@ class MexalDaemonApp:
             elif doc.doc_code in _FORNITORE_CODES and doc.piva:
                 documento["piva_fornitore"] = doc.piva
 
-            _supabase_post("documenti", documento, prefer="return=minimal")
-            _log(f"CRM: documenti insert OK tipo={crm_tipo} n={doc.doc_number}")
+            doc_uuid = _supabase_post_returning("documenti", documento)
+            if doc_uuid:
+                st["crm_doc_uuid"] = doc_uuid
+                _save_json(STATE_FILE, self.state)
+            _log(f"CRM: documenti insert OK tipo={crm_tipo} n={doc.doc_number} uuid={doc_uuid}")
+
+            # 5. Parsing e insert righe documento
+            if doc_uuid:
+                try:
+                    righe = _parse_righe_documento(doc.source_path)
+                    _log(f"CRM: righe parsed={len(righe)} per {doc.doc_number}")
+                    for riga in righe:
+                        esp_id = None
+                        # Upsert espositore se matricola presente
+                        if riga["tipo_riga"] == "espositore" and riga.get("matricola"):
+                            piva_cli = doc.piva if doc.doc_code in _CLIENTE_CODES else ""
+                            esp_id = _upsert_espositore(
+                                matricola=riga["matricola"],
+                                piva_cliente=piva_cli,
+                                data_prima_vendita=data_iso,
+                            )
+
+                        riga_payload: dict = {
+                            "documento_id": doc_uuid,
+                            "tipo_riga":    riga["tipo_riga"],
+                        }
+                        if riga.get("codice_articolo"):          riga_payload["codice_articolo"]  = riga["codice_articolo"]
+                        if riga.get("descrizione"):              riga_payload["descrizione"]       = riga["descrizione"]
+                        if riga.get("quantita") is not None:     riga_payload["quantita"]          = riga["quantita"]
+                        if riga.get("prezzo_unitario") is not None: riga_payload["prezzo_unitario"] = riga["prezzo_unitario"]
+                        if riga.get("totale_riga") is not None:  riga_payload["totale_riga"]       = riga["totale_riga"]
+                        if riga.get("note"):                     riga_payload["note"]              = riga["note"]
+                        if esp_id:                               riga_payload["espositore_id"]     = esp_id
+
+                        _supabase_post("righe_documento", riga_payload, prefer="return=minimal")
+
+                    _log(f"CRM: {len(righe)} righe inserite per doc {doc_uuid}")
+                except Exception as e:
+                    _log(f"CRM: righe insert FAIL doc={doc_uuid}: {e}")
 
             st["crm_synced"] = True
             _save_json(STATE_FILE, self.state)
